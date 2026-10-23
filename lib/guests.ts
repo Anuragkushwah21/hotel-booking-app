@@ -25,6 +25,11 @@ export async function resolveOrCreateGuest(
 
   const existing = await client.user.findUnique({ where: { email } })
   if (existing) {
+    // Never attach an anonymous public booking to a staff account merely
+    // because a visitor typed the same email address.
+    if (existing.role !== 'GUEST') {
+      throw new Error('This email belongs to a staff account')
+    }
     // Backfill a missing phone/name without clobbering what's already there.
     if ((phone && !existing.phone) || (input.name && !existing.name)) {
       return client.user.update({

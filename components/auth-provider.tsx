@@ -25,7 +25,7 @@ export type CurrentUser = {
   email: string
   name?: string | null
   isAdmin: boolean
-  role: 'USER' | 'ADMIN'
+  role: 'GUEST' | 'HOTEL_MANAGER' | 'ADMIN'
 }
 
 type AuthContextValue = {

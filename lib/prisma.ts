@@ -10,6 +10,23 @@ const globalForPrisma = globalThis as unknown as {
 };
 
 /**
+ * Prisma clients cache their generated model delegates when they are created.
+ * During `next dev`, globalThis survives a hot reload, so a client created
+ * before a schema change can otherwise live on without newly generated
+ * delegates (for example `hotelSettings`).
+ *
+ * Keep this list to the models used by the pricing/settings path. It lets a
+ * hot-reloaded server replace an incompatible cached client instead of
+ * returning a misleading "cannot read ... upsert" error from a route.
+ */
+const PRICING_MODEL_DELEGATES = ['hotelSettings', 'peakSeason', 'specialDate'] as const;
+
+function hasPricingModelDelegates(client: PrismaClient): boolean {
+  const delegates = client as unknown as Record<string, unknown>;
+  return PRICING_MODEL_DELEGATES.every((name) => typeof delegates[name] !== 'undefined');
+}
+
+/**
  * Bump this whenever the pool or client construction below changes.
  *
  * The cached pool survives hot reloads by design, which also means an edit to
@@ -55,12 +72,15 @@ pool.on('error', (error) => {
 
 const adapter = new PrismaPg(pool);
 
+const cachedPrisma = globalForPrisma.prisma;
+
 export const prisma =
-  globalForPrisma.prisma ??
-  new PrismaClient({
-    adapter,
-    log: process.env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'],
-  });
+  cachedPrisma && hasPricingModelDelegates(cachedPrisma)
+    ? cachedPrisma
+    : new PrismaClient({
+        adapter,
+        log: process.env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'],
+      });
 
 if (process.env.NODE_ENV !== 'production') {
   globalForPrisma.prisma = prisma;

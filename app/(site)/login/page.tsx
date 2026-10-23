@@ -41,7 +41,7 @@ const handleSubmit = async (e: React.FormEvent) => {
     // navigation, so it has to be told the session changed.
     await refresh()
 
-    if (user?.isAdmin || user?.role === 'ADMIN') {
+    if (user?.isAdmin || user?.role === 'ADMIN' || user?.role === 'HOTEL_MANAGER') {
       router.push('/admin')
     } else {
       router.push('/rooms')

@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
 import { requireManager } from '@/lib/auth'
 import { logManagerAction } from '@/lib/manager-log'
-import { blockingBookingFilter } from '@/lib/booking-engine'
+import { blockingBookingFilter, ROOM_BOOKING_TYPES } from '@/lib/booking-engine'
 
 type Ctx = { params: Promise<{ roomId: string }> }
 
@@ -41,7 +41,7 @@ export async function POST(req: NextRequest, { params }: Ctx) {
     const clashes = await prisma.booking.count({
       where: {
         roomId,
-        type: 'ROOM',
+        type: { in: ROOM_BOOKING_TYPES },
         AND: [
           blockingBookingFilter(),
           { checkInDate: { lt: end }, checkOutDate: { gt: start } },

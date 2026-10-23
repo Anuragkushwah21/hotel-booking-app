@@ -3,142 +3,111 @@ import { requireManager } from '@/lib/auth'
 import { prisma } from '@/lib/prisma'
 import { resolveOrCreateGuest } from '@/lib/guests'
 import { logManagerAction } from '@/lib/manager-log'
-import { notifySafely, sendBookingConfirmation } from '@/lib/notifications'
+import { notifyBooking, notifySafely } from '@/lib/notifications'
 import {
   BookingError,
   createRoomBooking,
   createTableBooking,
 } from '@/lib/booking-engine'
-import type { PaymentMode, PaymentStatus } from '@prisma/client'
-
-const PAYMENT_MODES: PaymentMode[] = ['ONLINE', 'CASH', 'CARD', 'UPI']
-const PAYMENT_STATUSES: PaymentStatus[] = ['PENDING', 'PAID', 'FAILED', 'REFUNDED']
+import { parseJson, walkInSchema } from '@/lib/validation'
 
 /**
  * POST /api/admin/bookings/walk-in
  *
- * Creates a booking on behalf of a walk-in guest. Runs through exactly the same
- * booking engine as the public site, so a walk-in and an online booking can
- * never claim the same room.
+ * Creates a booking on behalf of a walk-in guest: ROOM, TABLE or ROOM_TABLE.
+ * Runs through exactly the same booking engine as the public site, so a
+ * walk-in and an online booking can never claim the same room.
+ *
+ * Walk-ins are confirmed on the spot. The desk records how much it collected
+ * (paymentStatus PENDING / PARTIALLY_PAID + amountPaid / PAID) and that lands
+ * in the payment ledger.
  */
 export async function POST(req: NextRequest) {
   const auth = await requireManager()
   if (!auth.ok) return auth.response
 
+  const parsed = await parseJson(req, walkInSchema)
+  if (!parsed.ok) return parsed.response
+  const body = parsed.data
+
   try {
-    const body = await req.json()
-    const {
-      type,
-      roomId,
-      tableId,
-      checkInDate,
-      checkOutDate,
-      date,
-      time,
-      guestName,
-      guestEmail,
-      guestPhone,
-      guestCount,
-      specialRequest,
-      addOns,
-      paymentMode,
-      paymentStatus,
-      priceOverride,
-      notes,
-    } = body
-
-    if (type !== 'ROOM' && type !== 'TABLE') {
-      return NextResponse.json({ error: 'type must be ROOM or TABLE' }, { status: 400 })
-    }
-    if (!guestName?.trim() || !guestEmail?.trim()) {
-      return NextResponse.json(
-        { error: 'Guest name and email are required' },
-        { status: 400 },
-      )
-    }
-
-    const mode: PaymentMode = PAYMENT_MODES.includes(paymentMode) ? paymentMode : 'CASH'
-    const payStatus: PaymentStatus = PAYMENT_STATUSES.includes(paymentStatus)
-      ? paymentStatus
-      : 'PENDING'
-
-    if (mode === 'ONLINE') {
-      return NextResponse.json(
-        { error: 'Walk-in bookings settle at the desk: use CASH, CARD or UPI' },
-        { status: 400 },
-      )
-    }
-
     // Only an ADMIN may discount off the computed rate.
-    let override: number | null = null
-    if (priceOverride != null && priceOverride !== '') {
-      if (auth.user.role !== 'ADMIN') {
-        return NextResponse.json(
-          { error: 'Only an administrator can override the price' },
-          { status: 403 },
-        )
-      }
-      const n = Number(priceOverride)
-      if (!Number.isFinite(n) || n < 0) {
-        return NextResponse.json({ error: 'Invalid price override' }, { status: 400 })
-      }
-      override = Math.round(n)
+    if (body.priceOverride != null && auth.user.role !== 'ADMIN') {
+      return NextResponse.json(
+        { error: 'Only an administrator can override the price' },
+        { status: 403 },
+      )
     }
 
     const guest = await resolveOrCreateGuest({
-      name: guestName.trim(),
-      email: guestEmail.trim(),
-      phone: guestPhone?.trim() || null,
+      name: body.guestName,
+      email: body.guestEmail,
+      phone: body.guestPhone,
     })
 
     const shared = {
       userId: guest.id,
-      guestName: guestName.trim(),
-      guestEmail: guestEmail.trim().toLowerCase(),
-      guestPhone: guestPhone?.trim() || null,
-      guestCount: Number(guestCount) || 1,
-      specialRequest: specialRequest?.trim() || null,
-      addOns: Array.isArray(addOns) ? addOns : [],
+      guestName: body.guestName,
+      guestEmail: body.guestEmail,
+      guestPhone: body.guestPhone,
+      guestCount: body.guestCount,
+      specialRequest: body.specialRequest,
+      addOns: body.addOns,
       source: 'WALK_IN' as const,
       bookedById: auth.user.id,
-      paymentMode: mode,
-      paymentStatus: payStatus,
-      priceOverride: override,
+      paymentMode: body.paymentMode,
+      paymentStatus: body.paymentStatus,
+      amountPaid: body.amountPaid,
+      priceOverride: body.priceOverride,
+      adminNotes: body.notes,
     }
 
     const result =
-      type === 'ROOM'
-        ? await createRoomBooking({
+      body.type === 'TABLE'
+        ? await createTableBooking({
             ...shared,
-            roomId,
-            checkInDate,
-            checkOutDate,
+            tableId: body.tableId || null,
+            date: body.date!,
+            time: body.time!,
           })
-        : await createTableBooking({
+        : await createRoomBooking({
             ...shared,
-            tableId: tableId || null,
-            date,
-            time,
+            roomId: body.roomId!,
+            checkInDate: body.checkInDate!,
+            checkOutDate: body.checkOutDate!,
+            table:
+              body.type === 'ROOM_TABLE'
+                ? {
+                    date: body.date!,
+                    time: body.time!,
+                    guestCount: body.tableGuestCount ?? body.guestCount,
+                    tableId: body.tableId || null,
+                    // At the desk the manager asked for both; fail loudly
+                    // rather than silently dropping the table.
+                    required: true,
+                  }
+                : null,
           })
 
     const booking = result.booking
 
     await logManagerAction(auth.user.id, 'CREATE_BOOKING', {
       bookingId: booking.id,
-      notes: notes?.trim() || null,
+      notes: body.notes,
       metadata: {
-        type,
+        type: booking.type,
         source: 'WALK_IN',
         guestEmail: shared.guestEmail,
-        paymentMode: mode,
-        paymentStatus: payStatus,
+        paymentMode: body.paymentMode,
+        paymentStatus: booking.paymentStatus,
+        paidAmount: booking.paidAmount,
         totalPrice: booking.totalPrice,
         computedTotal: result.computedTotal,
-        priceOverridden: override != null,
+        priceOverridden: body.priceOverride != null,
       },
     })
 
-    notifySafely(() => sendBookingConfirmation(booking as any))
+    notifySafely(() => notifyBooking(booking.id, 'BOOKING_CONFIRMED'))
 
     return NextResponse.json(
       {
@@ -153,12 +122,19 @@ export async function POST(req: NextRequest) {
           paymentStatus: booking.paymentStatus,
           paymentMode: booking.paymentMode,
           guestName: booking.guestName,
+          roomNo: booking.assignedRoomNo,
+          tableNo: booking.table?.tableNo ?? null,
           checkInDate: booking.checkInDate,
           checkOutDate: booking.checkOutDate,
           bookingDate: booking.bookingDate,
           baseAmount: booking.baseAmount,
+          roomAmount: booking.roomAmount,
+          tableAmount: booking.tableAmount,
           addOnsAmount: booking.addOnsAmount,
+          taxAmount: booking.taxAmount,
           totalPrice: booking.totalPrice,
+          paidAmount: booking.paidAmount,
+          remainingAmount: booking.remainingAmount,
           computedTotal: result.computedTotal,
         },
       },
@@ -184,6 +160,7 @@ export async function GET(req: NextRequest) {
       select: {
         id: true, roomNo: true, name: true, type: true,
         acType: true, capacity: true, price: true, status: true,
+        weekendPrice: true, peakPrice: true, eventPrice: true,
       },
       orderBy: { roomNo: 'asc' },
     }),

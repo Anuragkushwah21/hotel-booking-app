@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
 import { requireManager } from '@/lib/auth'
 import { logManagerAction } from '@/lib/manager-log'
+import { parseJson } from '@/lib/validation'
+import { roomCreateSchema } from '@/lib/admin-schemas'
 
 /** GET /api/admin/room — full room list (staff view, includes maintenance). */
 export async function GET() {
@@ -31,39 +33,31 @@ export async function POST(req: NextRequest) {
   const auth = await requireManager()
   if (!auth.ok) return auth.response
 
+  const parsed = await parseJson(req, roomCreateSchema)
+  if (!parsed.ok) return parsed.response
+  const body = parsed.data
+
   try {
-    const body = await req.json()
-    const { roomNo, name, description, type, acType, capacity, price, status, amenities, photos } = body
-
-    if (!roomNo?.trim() || !name?.trim() || price == null) {
-      return NextResponse.json(
-        { error: 'roomNo, name and price are required' },
-        { status: 400 },
-      )
-    }
-
-    const priceValue = Number(price)
-    if (!Number.isFinite(priceValue) || priceValue < 0) {
-      return NextResponse.json({ error: 'price must be a positive number' }, { status: 400 })
-    }
-
-    const duplicate = await prisma.room.findUnique({ where: { roomNo: roomNo.trim() } })
+    const duplicate = await prisma.room.findUnique({ where: { roomNo: body.roomNo } })
     if (duplicate) {
       return NextResponse.json({ error: 'Room number already exists' }, { status: 409 })
     }
 
     const room = await prisma.room.create({
       data: {
-        roomNo: roomNo.trim(),
-        name: name.trim(),
-        description: description?.trim() || null,
-        type: type?.trim() || null,
-        acType: acType || 'AC',
-        capacity: Number(capacity) || 2,
-        price: Math.round(priceValue),
-        status: status || 'AVAILABLE',
-        amenities: Array.isArray(amenities) ? amenities : [],
-        photos: Array.isArray(photos) ? photos : [],
+        roomNo: body.roomNo,
+        name: body.name,
+        description: body.description || null,
+        type: body.type || null,
+        acType: body.acType,
+        capacity: body.capacity,
+        price: body.price,
+        weekendPrice: body.weekendPrice ?? null,
+        peakPrice: body.peakPrice ?? null,
+        eventPrice: body.eventPrice ?? null,
+        status: body.status,
+        amenities: body.amenities,
+        photos: body.photos,
       },
     })
 

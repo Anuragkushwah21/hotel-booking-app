@@ -2,24 +2,32 @@ import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
 import { requireManager, requireAdmin } from '@/lib/auth'
 import { logManagerAction } from '@/lib/manager-log'
-import { blockingBookingFilter } from '@/lib/booking-engine'
+import { blockingBookingFilter, ROOM_BOOKING_TYPES } from '@/lib/booking-engine'
+import { parseJson } from '@/lib/validation'
+import { roomUpdateSchema } from '@/lib/admin-schemas'
 
 type Ctx = { params: Promise<{ roomId: string }> }
 
-/** PUT — update a room. */
+/**
+ * PUT — update a room, including its premium nightly rates and whether it is
+ * in service (AVAILABLE) or out of service (MAINTENANCE).
+ */
 export async function PUT(req: NextRequest, { params }: Ctx) {
   const auth = await requireManager()
   if (!auth.ok) return auth.response
 
+  const parsed = await parseJson(req, roomUpdateSchema)
+  if (!parsed.ok) return parsed.response
+  const body = parsed.data
+
   try {
     const { roomId } = await params
-    const body = await req.json()
 
     const existing = await prisma.room.findUnique({ where: { id: roomId } })
     if (!existing) return NextResponse.json({ error: 'Room not found' }, { status: 404 })
 
-    if (body.roomNo && body.roomNo.trim() !== existing.roomNo) {
-      const dup = await prisma.room.findUnique({ where: { roomNo: body.roomNo.trim() } })
+    if (body.roomNo && body.roomNo !== existing.roomNo) {
+      const dup = await prisma.room.findUnique({ where: { roomNo: body.roomNo } })
       if (dup) return NextResponse.json({ error: 'Room number already exists' }, { status: 409 })
     }
 
@@ -27,7 +35,12 @@ export async function PUT(req: NextRequest, { params }: Ctx) {
     // silently strand them, so require the bookings be cleared first.
     if (body.status === 'MAINTENANCE' && existing.status !== 'MAINTENANCE') {
       const active = await prisma.booking.count({
-        where: { roomId, type: 'ROOM', AND: [blockingBookingFilter()] },
+        where: {
+          roomId,
+          type: { in: ROOM_BOOKING_TYPES },
+          checkOutDate: { gt: new Date() },
+          AND: [blockingBookingFilter()],
+        },
       })
       if (active > 0) {
         return NextResponse.json(
@@ -43,13 +56,16 @@ export async function PUT(req: NextRequest, { params }: Ctx) {
     const room = await prisma.room.update({
       where: { id: roomId },
       data: {
-        ...(body.roomNo !== undefined && { roomNo: body.roomNo.trim() }),
-        ...(body.name !== undefined && { name: body.name.trim() }),
-        ...(body.description !== undefined && { description: body.description?.trim() || null }),
-        ...(body.type !== undefined && { type: body.type?.trim() || null }),
+        ...(body.roomNo !== undefined && { roomNo: body.roomNo }),
+        ...(body.name !== undefined && { name: body.name }),
+        ...(body.description !== undefined && { description: body.description || null }),
+        ...(body.type !== undefined && { type: body.type || null }),
         ...(body.acType !== undefined && { acType: body.acType }),
-        ...(body.capacity !== undefined && { capacity: Number(body.capacity) }),
-        ...(body.price !== undefined && { price: Math.round(Number(body.price)) }),
+        ...(body.capacity !== undefined && { capacity: body.capacity }),
+        ...(body.price !== undefined && { price: body.price }),
+        ...(body.weekendPrice !== undefined && { weekendPrice: body.weekendPrice }),
+        ...(body.peakPrice !== undefined && { peakPrice: body.peakPrice }),
+        ...(body.eventPrice !== undefined && { eventPrice: body.eventPrice }),
         ...(body.status !== undefined && { status: body.status }),
         ...(body.amenities !== undefined && { amenities: body.amenities }),
         ...(body.photos !== undefined && { photos: body.photos }),

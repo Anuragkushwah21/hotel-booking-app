@@ -4,6 +4,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
 import { requireManager, requireAdmin } from '@/lib/auth'
 import { logManagerAction } from '@/lib/manager-log'
+import { blockingBookingFilter, TABLE_BOOKING_TYPES } from '@/lib/booking-engine'
 
 interface RouteParams {
   params: Promise<{ tableId: string }>
@@ -84,6 +85,28 @@ export async function PUT(
             error: 'Table number already exists',
           },
           { status: 409 }
+        )
+      }
+    }
+
+    // Don't take a table out of service under guests who have reserved it
+    // (table-only or as a room add-on).
+    if (status === 'MAINTENANCE' && existingTable.status !== 'MAINTENANCE') {
+      const upcoming = await prisma.booking.count({
+        where: {
+          tableId,
+          type: { in: TABLE_BOOKING_TYPES },
+          bookingDate: { gt: new Date() },
+          AND: [blockingBookingFilter()],
+        },
+      })
+      if (upcoming > 0) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: `Table has ${upcoming} upcoming reservation(s). Cancel or move them before marking it for maintenance.`,
+          },
+          { status: 409 },
         )
       }
     }

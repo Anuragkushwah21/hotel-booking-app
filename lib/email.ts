@@ -1,30 +1,14 @@
 // lib/email.ts
-import nodemailer from 'nodemailer'
+import { getMailer } from '@/lib/mailer'
 import { prisma } from '@/lib/prisma'
 
 // -------------------------
 // Transporter setup
 // -------------------------
 
-let transporter: nodemailer.Transporter | null = null
-
+// One SMTP transport for the whole app — see lib/mailer.ts.
 function getTransporter() {
-  if (!transporter) {
-    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASSWORD) {
-      console.warn(
-        'EMAIL_USER or EMAIL_PASSWORD missing. Emails will fail to send.',
-      )
-    }
-
-    transporter = nodemailer.createTransport({
-      service: 'gmail',
-      auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASSWORD,
-      },
-    })
-  }
-  return transporter
+  return getMailer()
 }
 
 // -------------------------
@@ -275,107 +259,6 @@ export async function sendPasswordResetEmail(
     return true
   } catch (error) {
     console.error('[v0] Error sending password reset email:', error)
-    return false
-  }
-}
-
-// -------------------------
-// Booking confirmation email – mostly unchanged
-// -------------------------
-
-export async function sendBookingConfirmationEmail(
-  email: string,
-  name: string,
-  bookingDetails: {
-    hotelName: string
-    roomType: string
-    checkIn: string
-    checkOut: string
-    totalPrice: number
-    bookingId: string
-    guestCount: number
-  },
-): Promise<boolean> {
-  try {
-    const transporter = getTransporter()
-
-    const mailOptions = {
-      from: process.env.EMAIL_USER,
-      to: email,
-      subject: `HotelBook - Booking Confirmation #${bookingDetails.bookingId}`,
-      html: `
-        <html>
-          <head>
-            <style>
-              body { font-family: Arial, sans-serif; background-color: #f5f5f5; }
-              .container { max-width: 600px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 8px; }
-              .header { text-align: center; margin-bottom: 30px; }
-              .logo { font-size: 24px; font-weight: bold; color: #D97706; }
-              .booking-details { background-color: #f9f9f9; padding: 15px; border-radius: 6px; margin: 20px 0; }
-              .detail-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #eee; }
-              .detail-label { font-weight: bold; color: #666; }
-              .detail-value { color: #333; }
-              .total-row { display: flex; justify-content: space-between; padding: 15px 0; font-size: 18px; font-weight: bold; border-top: 2px solid #D97706; }
-              .footer { text-align: center; color: #999; font-size: 12px; margin-top: 30px; }
-            </style>
-          </head>
-          <body>
-            <div class="container">
-              <div class="header">
-                <div class="logo">HotelBook</div>
-                <h1>Booking Confirmation</h1>
-              </div>
-
-              <p>Hi ${name},</p>
-              <p>Thank you for booking with HotelBook! Your reservation has been confirmed.</p>
-
-              <div class="booking-details">
-                <div class="detail-row">
-                  <span class="detail-label">Booking ID:</span>
-                  <span class="detail-value">#${bookingDetails.bookingId}</span>
-                </div>
-                <div class="detail-row">
-                  <span class="detail-label">Hotel:</span>
-                  <span class="detail-value">${bookingDetails.hotelName}</span>
-                </div>
-                <div class="detail-row">
-                  <span class="detail-label">Room Type:</span>
-                  <span class="detail-value">${bookingDetails.roomType}</span>
-                </div>
-                <div class="detail-row">
-                  <span class="detail-label">Check-in:</span>
-                  <span class="detail-value">${new Date(bookingDetails.checkIn).toLocaleDateString()}</span>
-                </div>
-                <div class="detail-row">
-                  <span class="detail-label">Check-out:</span>
-                  <span class="detail-value">${new Date(bookingDetails.checkOut).toLocaleDateString()}</span>
-                </div>
-                <div class="detail-row">
-                  <span class="detail-label">Guests:</span>
-                  <span class="detail-value">${bookingDetails.guestCount}</span>
-                </div>
-                <div class="total-row">
-                  <span>Total Price:</span>
-                  <span class="detail-value">$${bookingDetails.totalPrice.toFixed(2)}</span>
-                </div>
-              </div>
-
-              <p>You can manage your booking by logging into your account at HotelBook.</p>
-              <p>Best regards,<br>HotelBook Team</p>
-
-              <div class="footer">
-                <p>&copy; 2024 HotelBook. All rights reserved.</p>
-              </div>
-            </div>
-          </body>
-        </html>
-      `,
-    }
-
-    await transporter.sendMail(mailOptions)
-    return true
-  } catch (error) {
-    console.error('[v0] Error sending booking confirmation email:', error)
     return false
   }
 }

@@ -1,113 +1,212 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
 import { requireManager } from '@/lib/auth'
-import { blockingBookingFilter, startOfDay, endOfDay } from '@/lib/booking-engine'
+import { addDaysToKey, dateKey, istDayBounds } from '@/lib/format'
+import {
+  buildReport,
+  lastDays,
+  realBookings,
+  ROOM_BOOKING_TYPES,
+  TABLE_BOOKING_TYPES,
+} from '@/lib/admin-stats'
 
 /**
- * GET /api/admin/dashboard — today's front-desk picture.
- * Arrivals, departures, in-house, occupancy and revenue split by channel.
+ * GET /api/admin/dashboard — today's front-desk picture plus 30-day charts.
+ *
+ * "Today" is the IST calendar day. Unpaid online checkouts are excluded
+ * everywhere: an online booking reaches the dashboard only once its payment
+ * has confirmed it.
  */
 export async function GET(_req: NextRequest) {
   const auth = await requireManager()
   if (!auth.ok) return auth.response
 
   try {
-    const now = new Date()
-    const todayStart = startOfDay(now)
-    const todayEnd = endOfDay(now)
+    const todayKey = dateKey(new Date())
+    const { start: todayStart, end: todayEnd } = istDayBounds(todayKey)
+    const weekEnd = istDayBounds(addDaysToKey(todayKey, 7)).end
+    const tomorrowStart = istDayBounds(addDaysToKey(todayKey, 1)).start
 
-    const guestSelect = {
-      id: true, guestName: true, guestPhone: true, guestCount: true,
-      source: true, status: true, paymentStatus: true, totalPrice: true,
-      checkInDate: true, checkOutDate: true, bookingDate: true,
+    const listSelect = {
+      id: true, reference: true, type: true, guestName: true, guestPhone: true, guestCount: true,
+      source: true, status: true, paymentStatus: true, totalPrice: true, paidAmount: true,
+      remainingAmount: true, refundAmount: true, refundStatus: true, cancelReason: true,
+      checkInDate: true, checkOutDate: true, bookingDate: true, createdAt: true, assignedRoomNo: true,
       room: { select: { name: true, roomNo: true } },
       table: { select: { tableNo: true } },
-    }
+    } as const
+
+    const roomTypes = { type: { in: ROOM_BOOKING_TYPES } }
 
     const [
+      todaysBookings,
       arrivals,
       departures,
       inHouse,
       totalRooms,
-      occupiedNow,
-      todayRevenue,
-      pendingPayments,
+      maintenanceRooms,
+      occupiedToday,
+      blockedToday,
+      pending,
+      todayPayments,
+      allPayments,
+      typeSplit,
+      sourceSplit,
       tablesToday,
+      upcoming,
+      recent,
+      refundAlerts,
+      report,
     ] = await Promise.all([
+      prisma.booking.count({ where: { AND: [realBookings, { createdAt: { gte: todayStart, lt: todayEnd } }] } }),
       prisma.booking.findMany({
         where: {
-          type: 'ROOM',
+          ...roomTypes,
+          AND: [realBookings],
           status: { in: ['PENDING', 'CONFIRMED'] },
-          checkInDate: { gte: todayStart, lte: todayEnd },
+          checkInDate: { gte: todayStart, lt: todayEnd },
         },
-        select: guestSelect,
+        select: listSelect,
         orderBy: { checkInDate: 'asc' },
       }),
       prisma.booking.findMany({
-        where: {
-          type: 'ROOM',
-          status: 'CHECKED_IN',
-          checkOutDate: { gte: todayStart, lte: todayEnd },
-        },
-        select: guestSelect,
+        where: { ...roomTypes, status: 'CHECKED_IN', checkOutDate: { lt: todayEnd } },
+        select: listSelect,
         orderBy: { checkOutDate: 'asc' },
       }),
-      prisma.booking.count({ where: { type: 'ROOM', status: 'CHECKED_IN' } }),
-      prisma.room.count({ where: { status: { not: 'MAINTENANCE' } } }),
-      prisma.booking.count({
+      prisma.booking.count({ where: { ...roomTypes, status: 'CHECKED_IN' } }),
+      prisma.room.count(),
+      prisma.room.count({ where: { status: 'MAINTENANCE' } }),
+      prisma.booking.findMany({
         where: {
-          type: 'ROOM',
-          checkInDate: { lte: todayEnd },
+          ...roomTypes,
+          status: { in: ['CONFIRMED', 'CHECKED_IN'] },
+          checkInDate: { lt: todayEnd },
           checkOutDate: { gt: todayStart },
-          AND: [blockingBookingFilter(now)],
         },
+        select: { roomId: true },
+        distinct: ['roomId'],
+      }),
+      prisma.roomBlock.findMany({
+        where: { startDate: { lt: todayEnd }, endDate: { gt: todayStart }, room: { status: { not: 'MAINTENANCE' } } },
+        select: { roomId: true },
+        distinct: ['roomId'],
+      }),
+      prisma.booking.aggregate({
+        where: {
+          AND: [realBookings],
+          status: { in: ['PENDING', 'CONFIRMED', 'CHECKED_IN'] },
+          remainingAmount: { gt: 0 },
+        },
+        _sum: { remainingAmount: true },
+        _count: { _all: true },
+      }),
+      prisma.payment.groupBy({
+        by: ['kind'],
+        where: { status: 'SUCCEEDED', paidAt: { gte: todayStart, lt: todayEnd } },
+        _sum: { amount: true },
+      }),
+      prisma.payment.groupBy({
+        by: ['kind'],
+        where: { status: 'SUCCEEDED' },
+        _sum: { amount: true },
+      }),
+      prisma.booking.groupBy({
+        by: ['type'],
+        where: { AND: [realBookings], status: { not: 'CANCELLED' } },
+        _count: { _all: true },
       }),
       prisma.booking.groupBy({
         by: ['source'],
-        where: {
-          paymentStatus: 'PAID',
-          status: { not: 'CANCELLED' },
-          updatedAt: { gte: todayStart, lte: todayEnd },
-        },
-        _sum: { totalPrice: true },
-        _count: { _all: true },
-      }),
-      prisma.booking.aggregate({
-        where: { paymentStatus: 'PENDING', status: { in: ['PENDING', 'CONFIRMED', 'CHECKED_IN'] } },
-        _sum: { totalPrice: true },
+        where: { AND: [realBookings], status: { not: 'CANCELLED' } },
         _count: { _all: true },
       }),
       prisma.booking.count({
         where: {
-          type: 'TABLE',
-          bookingDate: { gte: todayStart, lte: todayEnd },
+          type: { in: TABLE_BOOKING_TYPES },
+          AND: [realBookings],
+          bookingDate: { gte: todayStart, lt: todayEnd },
           status: { not: 'CANCELLED' },
         },
       }),
+      prisma.booking.findMany({
+        where: {
+          ...roomTypes,
+          AND: [realBookings],
+          status: { in: ['PENDING', 'CONFIRMED'] },
+          checkInDate: { gte: tomorrowStart, lt: weekEnd },
+        },
+        select: listSelect,
+        orderBy: { checkInDate: 'asc' },
+        take: 20,
+      }),
+      prisma.booking.findMany({
+        where: realBookings,
+        select: listSelect,
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+      }),
+      prisma.booking.findMany({
+        where: { refundStatus: 'REFUND_PENDING' },
+        select: listSelect,
+        orderBy: { refundRequestedAt: 'asc' },
+        take: 20,
+      }),
+      (() => {
+        const r = lastDays(30)
+        return buildReport(r.from, r.to)
+      })(),
     ])
 
-    const onlineRevenue = todayRevenue.find((r) => r.source === 'ONLINE')?._sum.totalPrice ?? 0
-    const walkInRevenue = todayRevenue.find((r) => r.source === 'WALK_IN')?._sum.totalPrice ?? 0
+    const net = (rows: { kind: string; _sum: { amount: number | null } }[]) =>
+      rows.reduce((s, r) => s + (r.kind === 'REFUND' ? -1 : 1) * (r._sum.amount ?? 0), 0)
+
+    const sellable = totalRooms - maintenanceRooms
+    const blockedOnly = blockedToday.filter((b) => !occupiedToday.some((o) => o.roomId === b.roomId)).length
+    const occupied = occupiedToday.length
+    const available = Math.max(0, sellable - occupied - blockedOnly)
+    const count = <T extends { _count: { _all: number } }>(rows: T[], pick: (r: T) => boolean) =>
+      rows.find(pick)?._count._all ?? 0
 
     return NextResponse.json({
-      today: now.toISOString(),
+      today: todayKey,
       metrics: {
+        todaysBookings,
         arrivals: arrivals.length,
         departures: departures.length,
         inHouse,
-        totalRooms,
-        occupiedRooms: occupiedNow,
-        occupancyRate: totalRooms > 0 ? Math.round((occupiedNow / totalRooms) * 100) : 0,
+        totalRooms: sellable,
+        occupiedRooms: occupied,
+        availableRooms: available,
+        maintenanceRooms,
+        occupancyRate: sellable > 0 ? Math.round((occupied / sellable) * 100) : 0,
         tableReservationsToday: tablesToday,
-        revenueToday: onlineRevenue + walkInRevenue,
-        onlineRevenueToday: onlineRevenue,
-        walkInRevenueToday: walkInRevenue,
-        pendingPaymentCount: pendingPayments._count._all,
-        pendingPaymentAmount: pendingPayments._sum.totalPrice ?? 0,
+        pendingPaymentCount: pending._count._all,
+        pendingPaymentAmount: pending._sum.remainingAmount ?? 0,
+        revenueToday: net(todayPayments),
+        totalRevenue: net(allPayments),
+        refundsPending: refundAlerts.length,
+      },
+      split: {
+        rooms: count(typeSplit, (r) => r.type === 'ROOM'),
+        tables: count(typeSplit, (r) => r.type === 'TABLE'),
+        combined: count(typeSplit, (r) => r.type === 'ROOM_TABLE'),
+        online: count(sourceSplit, (r) => r.source === 'ONLINE'),
+        walkIn: count(sourceSplit, (r) => r.source === 'WALK_IN'),
       },
       arrivals,
       departures,
-    })
+      upcoming,
+      recent,
+      refundAlerts,
+      charts: {
+        bookings: report.bookings,
+        revenue: report.revenue,
+        occupancy: report.occupancy.slice(-14),
+        paymentStatus: report.byPaymentStatus,
+        topRoomTypes: report.topRoomTypes,
+      },
+    }, { headers: { 'Cache-Control': 'no-store' } })
   } catch (error) {
     console.error('[admin/dashboard] GET error:', error)
     return NextResponse.json({ error: 'Failed to load dashboard' }, { status: 500 })

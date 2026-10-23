@@ -11,6 +11,12 @@ import type { BookingStatus, ManagerActionType } from '@prisma/client'
  * Front-desk state transitions. Guarded so the desk can't check out a guest who
  * never checked in, or check in a cancelled booking.
  *
+ * CONFIRM is for WALK_IN bookings only. ONLINE bookings are never approved by
+ * staff: they confirm themselves when payment succeeds
+ * (lib/payment-confirmation.ts). An unpaid online booking is just an
+ * in-progress checkout; the desk can settle it with a payment instead
+ * (POST /api/admin/bookings/[id]/payments), which also confirms it.
+ *
  * Note: Room.status is deliberately NOT flipped to BOOKED on check-in.
  * Occupancy is derived from bookings; Room.status describes whether the room is
  * part of sellable inventory at all (AVAILABLE vs MAINTENANCE). Flipping it
@@ -57,14 +63,28 @@ export async function POST(
       )
     }
 
-    // Don't let an unpaid guest walk in without the desk noticing.
-    if (action === 'CHECK_IN' && booking.paymentStatus === 'PENDING') {
+    if (action === 'CONFIRM' && booking.source === 'ONLINE') {
+      return NextResponse.json(
+        {
+          error:
+            'Online bookings confirm automatically once payment succeeds. Record a desk payment to settle this one.',
+          code: 'ONLINE_AUTO_CONFIRM',
+        },
+        { status: 409 },
+      )
+    }
+
+    // Long stays and advance bookings owe a balance at check-in; don't let it
+    // slip past the desk unnoticed.
+    const balanceDue = booking.totalPrice - booking.paidAmount
+    if ((action === 'CHECK_IN' || action === 'CHECK_OUT') && balanceDue > 0) {
       if (req.nextUrl.searchParams.get('force') !== 'true') {
         return NextResponse.json(
           {
-            error: 'Payment is still pending for this booking',
+            error: `₹${balanceDue.toLocaleString('en-IN')} is still due on this booking`,
             code: 'PAYMENT_PENDING',
-            hint: 'Collect payment first, or retry with ?force=true to check in anyway.',
+            balanceDue,
+            hint: 'Collect the balance first, or retry with ?force=true to continue anyway.',
           },
           { status: 409 },
         )
@@ -80,6 +100,7 @@ export async function POST(
         holdExpiresAt: null,
         ...(action === 'CHECK_IN' ? { checkedInAt: new Date() } : {}),
         ...(action === 'CHECK_OUT' ? { checkedOutAt: new Date() } : {}),
+        ...(action === 'CONFIRM' ? { confirmedAt: new Date() } : {}),
       },
       include: {
         room: { select: { name: true, roomNo: true } },

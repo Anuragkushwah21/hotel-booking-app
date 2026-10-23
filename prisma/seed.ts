@@ -86,6 +86,9 @@ async function main() {
       acType: 'AC',
       capacity: 2,
       price: 2500,
+      weekendPrice: 3000,
+      peakPrice: 3500,
+      eventPrice: 4500,
       amenities: ['WiFi', 'AC', 'TV', 'Bathroom', 'Mini Bar'],
       photos: ['https://images.unsplash.com/photo-1611892440504-42a792e24d32'],
       status: RoomStatus.AVAILABLE,
@@ -208,6 +211,18 @@ async function main() {
 
   console.log('✅ Created 4 tables')
 
+  // ✅ Pricing & policy configuration (Admin → Settings / Room Types & Pricing)
+  await prisma.hotelSettings.upsert({ where: { id: 1 }, update: {}, create: { id: 1 } })
+  await prisma.peakSeason.create({
+    data: { name: 'Diwali week', startDate: new Date('2026-11-06T00:00:00Z'), endDate: new Date('2026-11-12T00:00:00Z') },
+  })
+  await prisma.specialDate.upsert({
+    where: { date: new Date('2026-12-31T00:00:00Z') },
+    update: {},
+    create: { name: "New Year's Eve", date: new Date('2026-12-31T00:00:00Z') },
+  })
+  console.log('✅ Created pricing settings, a peak season and an event date')
+
   // ✅ Create sample room booking
   const roomBooking1 = await prisma.booking.create({
     data: {
@@ -225,10 +240,25 @@ async function main() {
       paymentMode: 'ONLINE',
       addOns: ['BREAKFAST'],
       baseAmount: 7500,
+      roomAmount: 7500,
       addOnsAmount: 2100, // breakfast: ₹350 x 3 nights x 2 guests
       totalPrice: 9600,
+      // Paid the 50% advance online; balance due at check-in.
+      paymentRule: 'STANDARD_ADVANCE',
+      advanceAmount: 4800,
+      paidAmount: 4800,
+      remainingAmount: 4800,
+      assignedRoomNo: '101',
+      confirmedAt: new Date(),
       status: BookingStatus.CONFIRMED,
-      paymentStatus: PaymentStatus.PAID,
+      paymentStatus: PaymentStatus.PARTIALLY_PAID,
+      payments: {
+        create: {
+          kind: 'ADVANCE', status: 'SUCCEEDED', mode: 'ONLINE', amount: 4800,
+          gateway: 'MOCK', gatewayOrderId: 'mock_order_seed_1', gatewayPaymentId: 'mock_pay_seed_1',
+          paidAt: new Date(),
+        },
+      },
     },
   })
 
@@ -247,9 +277,24 @@ async function main() {
       source: 'ONLINE',
       paymentMode: 'ONLINE',
       baseAmount: 2000,
+      tableAmount: 2000,
+      tableGuestCount: 4,
       totalPrice: 2000, // 4 guests x ₹500
-      status: BookingStatus.PENDING,
-      paymentStatus: PaymentStatus.PENDING,
+      // Table reservations are paid in full online.
+      paymentRule: 'TABLE_FULL',
+      advanceAmount: 2000,
+      paidAmount: 2000,
+      remainingAmount: 0,
+      confirmedAt: new Date(),
+      status: BookingStatus.CONFIRMED,
+      paymentStatus: PaymentStatus.PAID,
+      payments: {
+        create: {
+          kind: 'FULL', status: 'SUCCEEDED', mode: 'ONLINE', amount: 2000,
+          gateway: 'MOCK', gatewayOrderId: 'mock_order_seed_2', gatewayPaymentId: 'mock_pay_seed_2',
+          paidAt: new Date(),
+        },
+      },
     },
   })
 
@@ -281,9 +326,22 @@ async function main() {
       bookedById: manager.id,
       paymentMode: 'CASH',
       baseAmount: 3000,
+      roomAmount: 3000,
       totalPrice: 3000, // 2 nights x ₹1500
+      paymentRule: 'DESK',
+      advanceAmount: 3000,
+      paidAmount: 3000,
+      remainingAmount: 0,
+      assignedRoomNo: room3.roomNo,
+      confirmedAt: new Date(),
       status: BookingStatus.CONFIRMED,
       paymentStatus: PaymentStatus.PAID,
+      payments: {
+        create: {
+          kind: 'FULL', status: 'SUCCEEDED', mode: 'CASH', amount: 3000,
+          gateway: 'DESK', recordedById: manager.id, paidAt: new Date(),
+        },
+      },
     },
   })
 

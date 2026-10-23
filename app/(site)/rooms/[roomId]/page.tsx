@@ -1,20 +1,24 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState, Suspense } from 'react'
+import { useEffect, useMemo, useState, Suspense } from 'react'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import {
   Users, Snowflake, Wind, ArrowLeft, CheckCircle2, AlertCircle,
-  Loader2, Info, ShieldCheck, Clock,
+  Loader2, ShieldCheck, Clock, UtensilsCrossed, ArrowRight, Info,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Textarea } from '@/components/ui/textarea'
+import {
+  Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue,
+} from '@/components/ui/select'
 import { RoomGallery } from '@/components/site/room-gallery'
 import { Icon } from '@/components/site/icon'
+import { PriceSummary, PolicyList, TABLE_SLOTS, slotLabel } from '@/components/site/price-summary'
 import { HOTEL } from '@/lib/hotel'
-import { useAuth } from '@/components/auth-provider'
+import { formatINR } from '@/lib/format'
+import type { Quote } from '@/lib/pricing'
 
 type Room = {
   id: string; roomNo: string; name: string; type: string | null
@@ -25,9 +29,22 @@ type Service = {
   code: string; label: string; description: string
   icon: string; price: number; per: 'BOOKING' | 'NIGHT' | 'GUEST_NIGHT'; unitLabel: string
 }
+type QuoteResponse = {
+  nights: number
+  available: boolean
+  unavailableReason: string | null
+  overCapacity: boolean
+  table: { available: boolean; tableNo?: string; reason?: string } | null
+  quote: Quote
+  policy: string[]
+}
 
-const inr = (n: number) => `₹${n.toLocaleString('en-IN')}`
 const todayStr = () => new Date().toISOString().split('T')[0]
+const addDays = (d: string, n: number) => {
+  const x = new Date(`${d}T00:00:00Z`)
+  x.setUTCDate(x.getUTCDate() + n)
+  return x.toISOString().slice(0, 10)
+}
 
 function RoomDetailContent() {
   const { roomId } = useParams<{ roomId: string }>()
@@ -39,29 +56,21 @@ function RoomDetailContent() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
-  const [checkIn, setCheckIn] = useState(searchParams.get('checkIn') || todayStr())
-  const [checkOut, setCheckOut] = useState(searchParams.get('checkOut') || '')
+  const initialIn = searchParams.get('checkIn') || todayStr()
+  const [checkIn, setCheckIn] = useState(initialIn)
+  const [checkOut, setCheckOut] = useState(searchParams.get('checkOut') || addDays(initialIn, 1))
   const [guestCount, setGuestCount] = useState(searchParams.get('guests') || '1')
   const [addOns, setAddOns] = useState<string[]>([])
 
-  const { user } = useAuth()
+  // Optional restaurant table add-on.
+  const [withTable, setWithTable] = useState(false)
+  const [tableDate, setTableDate] = useState(initialIn)
+  const [tableTime, setTableTime] = useState('19:30')
+  const [tableGuests, setTableGuests] = useState(searchParams.get('guests') || '2')
 
-  const [guestName, setGuestName] = useState('')
-  const [guestEmail, setGuestEmail] = useState('')
-  const [guestPhone, setGuestPhone] = useState('')
-  const [specialRequest, setSpecialRequest] = useState('')
-
-  const [availability, setAvailability] = useState<{ available: boolean; message: string } | null>(null)
-  const [checking, setChecking] = useState(false)
-  const [submitting, setSubmitting] = useState(false)
-
-  // Prefill from the signed-in account so guests aren't retyping what we know.
-  // Reads the shared session rather than asking the server again.
-  useEffect(() => {
-    if (!user) return
-    setGuestName((n) => n || user.name || '')
-    setGuestEmail((e) => e || user.email || '')
-  }, [user])
+  const [quote, setQuote] = useState<QuoteResponse | null>(null)
+  const [quoting, setQuoting] = useState(false)
+  const [quoteError, setQuoteError] = useState('')
 
   useEffect(() => {
     if (!roomId) return
@@ -84,110 +93,78 @@ function RoomDetailContent() {
     })()
   }, [roomId])
 
+  // Keep the table date inside the stay when the dates move.
+  useEffect(() => {
+    if (tableDate < checkIn || (checkOut && tableDate > checkOut)) setTableDate(checkIn)
+  }, [checkIn, checkOut, tableDate])
+
   const nights = useMemo(() => {
     if (!checkIn || !checkOut) return 0
-    const n = Math.round(
-      (new Date(checkOut).getTime() - new Date(checkIn).getTime()) / 86_400_000,
-    )
+    const n = Math.round((new Date(checkOut).getTime() - new Date(checkIn).getTime()) / 86_400_000)
     return n > 0 ? n : 0
   }, [checkIn, checkOut])
-
   const guests = Math.max(1, Number(guestCount) || 1)
+  const diners = Math.max(1, Number(tableGuests) || 1)
 
-  // Live availability whenever the dates change.
-  const checkAvailability = useCallback(async () => {
+  // Live server quote: price, availability, table and payment split.
+  useEffect(() => {
     if (!roomId || nights <= 0) {
-      setAvailability(null)
+      setQuote(null)
       return
     }
-    setChecking(true)
-    try {
-      const res = await fetch('/api/rooms/available', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomId, checkInDate: checkIn, checkOutDate: checkOut }),
-      })
-      const data = await res.json()
-      setAvailability(
-        res.ok
-          ? { available: data.available, message: data.message }
-          : { available: false, message: data.error || 'Could not check availability' },
-      )
-    } catch {
-      setAvailability({ available: false, message: 'Could not check availability' })
-    } finally {
-      setChecking(false)
-    }
-  }, [roomId, checkIn, checkOut, nights])
-
-  useEffect(() => {
-    const t = setTimeout(checkAvailability, 300)
-    return () => clearTimeout(t)
-  }, [checkAvailability])
-
-  // Mirrors priceAddOns() in lib/booking-engine.ts. Indicative only — the
-  // server recomputes the total and its figure is what gets charged.
-  const lines = useMemo(() => {
-    const out: { label: string; amount: number }[] = []
-    if (room && nights > 0) {
-      out.push({
-        label: `${inr(room.price)} × ${nights} night${nights > 1 ? 's' : ''}`,
-        amount: room.price * nights,
-      })
-    }
-    for (const code of addOns) {
-      const s = services.find((x) => x.code === code)
-      if (!s) continue
-      const amount =
-        s.per === 'BOOKING' ? s.price
-        : s.per === 'NIGHT' ? s.price * Math.max(nights, 1)
-        : s.price * Math.max(nights, 1) * guests
-      out.push({ label: s.label, amount })
-    }
-    return out
-  }, [room, nights, addOns, services, guests])
-
-  const total = lines.reduce((s, l) => s + l.amount, 0)
-  const overCapacity = room ? guests > room.capacity : false
-  const canBook =
-    !!room && nights > 0 && !overCapacity && availability?.available === true &&
-    guestName.trim() !== '' && guestEmail.trim() !== ''
-
-  const handleBook = async (e: React.FormEvent) => {
-    e.preventDefault()
-    setError('')
-    setSubmitting(true)
-    try {
-      const res = await fetch('/api/bookings/rooms', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          roomId,
-          checkInDate: checkIn,
-          checkOutDate: checkOut,
-          guestCount: guests,
-          guestName: guestName.trim(),
-          guestEmail: guestEmail.trim(),
-          guestPhone: guestPhone.trim() || null,
-          specialRequest: specialRequest.trim() || null,
-          addOns,
-        }),
-      })
-      const data = await res.json()
-
-      if (res.status === 401) {
-        router.push(`/login?next=/rooms/${roomId}`)
-        return
+    const ctrl = new AbortController()
+    const t = setTimeout(async () => {
+      setQuoting(true)
+      try {
+        const res = await fetch('/api/quote', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: ctrl.signal,
+          body: JSON.stringify({
+            kind: 'ROOM',
+            roomId,
+            checkInDate: checkIn,
+            checkOutDate: checkOut,
+            guestCount: guests,
+            addOns,
+            table: withTable ? { date: tableDate, time: tableTime, guestCount: diners } : null,
+          }),
+        })
+        const data = await res.json()
+        if (!res.ok) throw new Error(data.error || 'Could not price this stay')
+        setQuote(data)
+        setQuoteError('')
+      } catch (e) {
+        if ((e as Error).name === 'AbortError') return
+        setQuote(null)
+        setQuoteError(e instanceof Error ? e.message : 'Could not price this stay')
+      } finally {
+        setQuoting(false)
       }
-      if (!res.ok) throw new Error(data.error || 'Could not complete the booking')
-
-      router.push('/bookings?booked=1')
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not complete the booking')
-      checkAvailability()
-    } finally {
-      setSubmitting(false)
+    }, 300)
+    return () => {
+      clearTimeout(t)
+      ctrl.abort()
     }
+  }, [roomId, checkIn, checkOut, guests, addOns, withTable, tableDate, tableTime, diners, nights])
+
+  const overCapacity = room ? guests > room.capacity : false
+  const canProceed = !!room && nights > 0 && !overCapacity && quote?.available === true && !quoting
+
+  const proceed = () => {
+    const params = new URLSearchParams({
+      roomId,
+      checkIn,
+      checkOut,
+      guests: String(guests),
+    })
+    if (addOns.length) params.set('addOns', addOns.join(','))
+    if (withTable && quote?.table?.available) {
+      params.set('tableDate', tableDate)
+      params.set('tableTime', tableTime)
+      params.set('tableGuests', String(diners))
+    }
+    router.push(`/checkout?${params}`)
   }
 
   if (loading) {
@@ -214,7 +191,7 @@ function RoomDetailContent() {
   return (
     <div className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
       <Link
-        href="/rooms"
+        href={`/rooms?${new URLSearchParams({ checkIn, checkOut, guests: String(guests) })}`}
         className="mb-5 inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-primary"
       >
         <ArrowLeft className="h-4 w-4" />
@@ -238,8 +215,8 @@ function RoomDetailContent() {
                 <p className="text-sm text-muted-foreground">Room {room.roomNo}</p>
               </div>
               <div className="text-right">
-                <p className="text-2xl font-bold tabular-nums">{inr(room.price)}</p>
-                <p className="text-xs text-muted-foreground">per night</p>
+                <p className="text-2xl font-bold tabular-nums">{formatINR(room.price)}</p>
+                <p className="text-xs text-muted-foreground">per night, from</p>
               </div>
             </div>
 
@@ -254,7 +231,7 @@ function RoomDetailContent() {
               </span>
               <span className="flex items-center gap-1.5">
                 <Clock className="h-4 w-4" />
-                Check-in {HOTEL.policies.checkIn}
+                Check-in {HOTEL.policies.checkIn} · Check-out {HOTEL.policies.checkOut}
               </span>
             </div>
 
@@ -298,26 +275,29 @@ function RoomDetailContent() {
           </div>
         </div>
 
-        {/* ---------------- right: booking ---------------- */}
+        {/* ---------------- right: price & add-ons ---------------- */}
         <div className="lg:sticky lg:top-6 lg:self-start">
-          <form onSubmit={handleBook} className="rounded-xl border border-border bg-card p-5 shadow-sm">
-            <h2 className="text-lg font-semibold">Book this room</h2>
+          <div className="rounded-xl border border-border bg-card p-5 shadow-sm">
+            <h2 className="text-lg font-semibold">Your stay</h2>
 
             <div className="mt-4 grid grid-cols-2 gap-3">
               <div>
-                <Label className="mb-1 block text-xs">Check-in</Label>
-                <Input type="date" min={todayStr()} value={checkIn} onChange={(e) => setCheckIn(e.target.value)} required />
+                <Label htmlFor="checkIn" className="mb-1 block text-xs">Check-in</Label>
+                <Input id="checkIn" type="date" min={todayStr()} value={checkIn}
+                  onChange={(e) => {
+                    setCheckIn(e.target.value)
+                    if (checkOut <= e.target.value) setCheckOut(addDays(e.target.value, 1))
+                  }} />
               </div>
               <div>
-                <Label className="mb-1 block text-xs">Check-out</Label>
-                <Input type="date" min={checkIn || todayStr()} value={checkOut} onChange={(e) => setCheckOut(e.target.value)} required />
+                <Label htmlFor="checkOut" className="mb-1 block text-xs">Check-out</Label>
+                <Input id="checkOut" type="date" min={checkIn ? addDays(checkIn, 1) : todayStr()} value={checkOut}
+                  onChange={(e) => setCheckOut(e.target.value)} />
               </div>
               <div className="col-span-2">
-                <Label className="mb-1 block text-xs">Guests</Label>
-                <Input
-                  type="number" min={1} max={room.capacity}
-                  value={guestCount} onChange={(e) => setGuestCount(e.target.value)} required
-                />
+                <Label htmlFor="guests" className="mb-1 block text-xs">Guests</Label>
+                <Input id="guests" type="number" min={1} max={room.capacity}
+                  value={guestCount} onChange={(e) => setGuestCount(e.target.value)} />
                 {overCapacity && (
                   <p className="mt-1 text-xs text-destructive">
                     This room sleeps {room.capacity}. Pick a larger room for {guests} guests.
@@ -329,19 +309,26 @@ function RoomDetailContent() {
             {/* availability */}
             {nights > 0 && (
               <div
+                role="status"
                 className={`mt-3 flex items-start gap-2 rounded-lg border p-2.5 text-xs ${
-                  checking
+                  quoting || !quote
                     ? 'border-border bg-muted/50 text-muted-foreground'
-                    : availability?.available
+                    : quote.available
                       ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
                       : 'border-destructive/30 bg-destructive/5 text-destructive'
                 }`}
               >
-                {checking ? <Loader2 className="mt-px h-3.5 w-3.5 animate-spin" />
-                  : availability?.available ? <CheckCircle2 className="mt-px h-3.5 w-3.5" />
+                {quoting ? <Loader2 className="mt-px h-3.5 w-3.5 animate-spin" />
+                  : quote?.available ? <CheckCircle2 className="mt-px h-3.5 w-3.5" />
                   : <AlertCircle className="mt-px h-3.5 w-3.5" />}
                 <span>
-                  {checking ? 'Checking availability…' : availability?.message ?? ''}
+                  {quoting
+                    ? 'Checking availability…'
+                    : quoteError
+                      ? quoteError
+                      : quote?.available
+                        ? `Available for ${nights} night${nights > 1 ? 's' : ''}`
+                        : quote?.unavailableReason ?? 'Not available for these dates'}
                 </span>
               </div>
             )}
@@ -358,6 +345,7 @@ function RoomDetailContent() {
                       <button
                         key={s.code}
                         type="button"
+                        aria-pressed={on}
                         onClick={() =>
                           setAddOns((c) => (on ? c.filter((x) => x !== s.code) : [...c, s.code]))
                         }
@@ -377,7 +365,7 @@ function RoomDetailContent() {
                         <span className="min-w-0 flex-1">
                           <span className="block truncate text-sm">{s.label}</span>
                           <span className="block text-[11px] text-muted-foreground">
-                            {inr(s.price)} {s.unitLabel}
+                            {formatINR(s.price)} {s.unitLabel}
                           </span>
                         </span>
                       </button>
@@ -387,70 +375,106 @@ function RoomDetailContent() {
               </div>
             )}
 
-            {/* guest details */}
-            <div className="mt-5 space-y-3 border-t border-border pt-4">
-              <div>
-                <Label className="mb-1 block text-xs">Full name</Label>
-                <Input value={guestName} onChange={(e) => setGuestName(e.target.value)} placeholder="Your name" required />
-              </div>
-              <div>
-                <Label className="mb-1 block text-xs">Email</Label>
-                <Input type="email" value={guestEmail} onChange={(e) => setGuestEmail(e.target.value)} placeholder="you@example.com" required />
-              </div>
-              <div>
-                <Label className="mb-1 block text-xs">Phone</Label>
-                <Input type="tel" value={guestPhone} onChange={(e) => setGuestPhone(e.target.value)} placeholder="+91 98765 43210" />
-              </div>
-              <div>
-                <Label className="mb-1 block text-xs">Special request</Label>
-                <Textarea rows={2} value={specialRequest} onChange={(e) => setSpecialRequest(e.target.value)} placeholder="Late check-in, high floor…" />
-              </div>
+            {/* optional table add-on */}
+            <div className="mt-5 rounded-lg border border-border p-3">
+              <label className="flex cursor-pointer items-start gap-2.5">
+                <input
+                  type="checkbox"
+                  className="mt-0.5 h-4 w-4 accent-[var(--primary)]"
+                  checked={withTable}
+                  onChange={(e) => setWithTable(e.target.checked)}
+                />
+                <span>
+                  <span className="flex items-center gap-1.5 text-sm font-medium">
+                    <UtensilsCrossed className="h-4 w-4 text-primary" aria-hidden />
+                    Add a table at {HOTEL.dining.name}
+                  </span>
+                  <span className="block text-xs text-muted-foreground">
+                    Optional. If no table is free, your room is still booked.
+                  </span>
+                </span>
+              </label>
+
+              {withTable && (
+                <div className="mt-3 grid grid-cols-2 gap-2">
+                  <div>
+                    <Label htmlFor="tableDate" className="mb-1 block text-xs">Date</Label>
+                    <Input id="tableDate" type="date" min={checkIn} max={checkOut || undefined}
+                      value={tableDate} onChange={(e) => setTableDate(e.target.value)} />
+                  </div>
+                  <div>
+                    <Label htmlFor="tableGuests" className="mb-1 block text-xs">Diners</Label>
+                    <Input id="tableGuests" type="number" min={1} max={20}
+                      value={tableGuests} onChange={(e) => setTableGuests(e.target.value)} />
+                  </div>
+                  <div className="col-span-2">
+                    <Label className="mb-1 block text-xs">Time</Label>
+                    <Select value={tableTime} onValueChange={setTableTime}>
+                      <SelectTrigger aria-label="Table time"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        {(['Lunch', 'Dinner'] as const).map((g) => (
+                          <SelectGroup key={g}>
+                            <SelectLabel>{g}</SelectLabel>
+                            {TABLE_SLOTS.filter((s) => s.group === g).map((s) => (
+                              <SelectItem key={s.value} value={s.value}>{s.label}</SelectItem>
+                            ))}
+                          </SelectGroup>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  {quote?.table && !quoting && (
+                    <p
+                      className={`col-span-2 flex items-start gap-1.5 text-xs ${
+                        quote.table.available ? 'text-emerald-700' : 'text-muted-foreground'
+                      }`}
+                    >
+                      {quote.table.available ? (
+                        <><CheckCircle2 className="mt-px h-3.5 w-3.5" />Table {quote.table.tableNo} is free at {slotLabel(tableTime)}.</>
+                      ) : (
+                        <><Info className="mt-px h-3.5 w-3.5" />No table free at that time — your room will still be booked. Try another time.</>
+                      )}
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* price */}
             <div className="mt-5 border-t border-border pt-4">
-              {lines.length === 0 ? (
-                <p className="text-xs text-muted-foreground">Pick your dates to see the price.</p>
+              {quote ? (
+                <PriceSummary
+                  quote={quote.quote}
+                  tableLabel={
+                    withTable && quote.table?.available
+                      ? `Table for ${diners} · ${slotLabel(tableTime)}`
+                      : null
+                  }
+                />
               ) : (
-                <ul className="space-y-1.5">
-                  {lines.map((l, i) => (
-                    <li key={i} className="flex justify-between gap-3 text-xs">
-                      <span className="min-w-0 truncate text-muted-foreground">{l.label}</span>
-                      <span className="flex-shrink-0 tabular-nums">{inr(l.amount)}</span>
-                    </li>
-                  ))}
-                </ul>
+                <p className="text-xs text-muted-foreground">
+                  {nights > 0 ? 'Pricing your stay…' : 'Pick your dates to see the price.'}
+                </p>
               )}
-              <div className="mt-3 flex items-baseline justify-between border-t border-border pt-3">
-                <span className="font-medium">Total</span>
-                <span className="text-xl font-bold tabular-nums">{inr(total)}</span>
-              </div>
-              <p className="mt-2 flex items-start gap-1.5 text-[11px] text-muted-foreground">
-                <Info className="mt-px h-3 w-3 flex-shrink-0" />
-                Confirmed server-side when you book. Free cancellation up to 24 hours before check-in.
-              </p>
             </div>
 
-            {error && (
-              <div className="mt-4 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-2.5 text-xs text-destructive">
-                <AlertCircle className="mt-px h-3.5 w-3.5 flex-shrink-0" />
-                {error}
+            <Button type="button" className="mt-4 h-11 w-full" disabled={!canProceed} onClick={proceed}>
+              Proceed to checkout
+              <ArrowRight className="ml-2 h-4 w-4" />
+            </Button>
+
+            {quote?.policy && quote.policy.length > 0 && (
+              <div className="mt-4 border-t border-border pt-3">
+                <p className="mb-1.5 text-xs font-medium">Cancellation policy</p>
+                <PolicyList lines={quote.policy} />
               </div>
             )}
 
-            <Button type="submit" className="mt-4 h-11 w-full" disabled={!canBook || submitting}>
-              {submitting ? (
-                <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Booking…</>
-              ) : (
-                <>Confirm booking · {inr(total)}</>
-              )}
-            </Button>
-
             <p className="mt-3 flex items-center justify-center gap-1.5 text-[11px] text-muted-foreground">
               <ShieldCheck className="h-3 w-3" />
-              You&apos;ll be asked to sign in if you aren&apos;t already.
+              Confirmed instantly once payment succeeds.
             </p>
-          </form>
+          </div>
         </div>
       </div>
     </div>

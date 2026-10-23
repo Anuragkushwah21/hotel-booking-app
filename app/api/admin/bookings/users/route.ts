@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
-import { requireManager } from '@/lib/auth'
+import { requireAdmin } from '@/lib/auth'
+import { realBookings } from '@/lib/admin-stats'
 
-export async function GET(req: NextRequest) {
-  const auth = await requireManager()
+/** GET — legacy per-user totals. Prefer /api/admin/users. (ADMIN) */
+export async function GET(_req: NextRequest) {
+  const auth = await requireAdmin()
   if (!auth.ok) return auth.response
 
   try {
@@ -13,10 +15,14 @@ export async function GET(req: NextRequest) {
         email: true,
         name: true,
         bookings: {
+          where: realBookings,
           select: {
             id: true,
             type: true,
             totalPrice: true,
+            paidAmount: true,
+            remainingAmount: true,
+            status: true,
             paymentStatus: true,
             createdAt: true,
           },
@@ -25,13 +31,11 @@ export async function GET(req: NextRequest) {
     })
 
     const mapped = users.map(u => {
-      const totalPaid = u.bookings
-        .filter(b => b.paymentStatus === 'PAID')
-        .reduce((sum, b) => sum + b.totalPrice, 0)
-
+      // Money actually received vs still owed, from the ledger-backed columns.
+      const totalPaid = u.bookings.reduce((sum, b) => sum + b.paidAmount, 0)
       const totalUnpaid = u.bookings
-        .filter(b => b.paymentStatus !== 'PAID')
-        .reduce((sum, b) => sum + b.totalPrice, 0)
+        .filter(b => b.status !== 'CANCELLED')
+        .reduce((sum, b) => sum + b.remainingAmount, 0)
 
       return {
         id: u.id,

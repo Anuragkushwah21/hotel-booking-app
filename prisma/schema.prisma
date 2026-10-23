@@ -30,12 +30,13 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  bookings        Booking[]       @relation("GuestBookings")
-  managedBookings Booking[]       @relation("ManagerBookings")
-  managerActions  ManagerAction[]
-  otpCodes        OTPCode[]
-  reviews         Review[]
-  sessions        Session[]
+  bookings         Booking[]       @relation("GuestBookings")
+  managedBookings  Booking[]       @relation("ManagerBookings")
+  managerActions   ManagerAction[]
+  otpCodes         OTPCode[]
+  paymentsRecorded Payment[]       @relation("PaymentsRecorded")
+  reviews          Review[]
+  sessions         Session[]
 
   @@index([email])
   @@index([phone])
@@ -88,19 +89,24 @@ model PasswordResetToken {
 // ============================================
 
 model Room {
-  id          String     @id @default(cuid())
-  roomNo      String     @unique
-  name        String
-  description String?
-  type        String?
-  acType      String     @default("AC")
-  capacity    Int        @default(2)
-  price       Int // per night, in whole INR
-  photos      String[]   @default([])
-  status      RoomStatus @default(AVAILABLE)
-  amenities   String[]   @default([])
-  createdAt   DateTime   @default(now())
-  updatedAt   DateTime   @updatedAt
+  id           String     @id @default(cuid())
+  roomNo       String     @unique
+  name         String
+  description  String?
+  type         String?
+  acType       String     @default("AC")
+  capacity     Int        @default(2)
+  price        Int // per night, in whole INR
+  // Optional nightly rates for premium dates; null falls back to `price`.
+  // Resolution order per night: event date → peak season → weekend → normal.
+  weekendPrice Int?
+  peakPrice    Int?
+  eventPrice   Int?
+  photos       String[]   @default([])
+  status       RoomStatus @default(AVAILABLE)
+  amenities    String[]   @default([])
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
 
   bookings     Booking[]
   availability RoomAvailability[]
@@ -169,8 +175,8 @@ model Booking {
   /// and manual inserts get one too — see prisma/manual/002_booking_reference.sql.
   reference String @unique @default(dbgenerated("generate_booking_ref()"))
 
-  roomId  String? // set when type = ROOM
-  tableId String? // set when type = TABLE
+  roomId  String? // set when type = ROOM or ROOM_TABLE
+  tableId String? // set when type = TABLE or ROOM_TABLE
   type    BookingType
 
   // Room booking window
@@ -178,7 +184,13 @@ model Booking {
   checkOutDate DateTime?
 
   // Table booking slot
-  bookingDate DateTime?
+  bookingDate     DateTime?
+  /// Party size for the table leg of a ROOM_TABLE booking (guestCount is the room's).
+  tableGuestCount Int?
+
+  /// Room number snapshot taken when the booking is confirmed, so the number the
+  /// guest was told survives later inventory edits.
+  assignedRoomNo String?
 
   guestCount     Int
   guestName      String
@@ -193,14 +205,30 @@ model Booking {
   addOns      String[]      @default([])
 
   // --- money (whole INR) ---
-  baseAmount   Int @default(0) // room/table charge before add-ons
-  addOnsAmount Int @default(0)
-  totalPrice   Int
-  refundAmount Int @default(0)
+  baseAmount      Int     @default(0) // room + table charge before add-ons
+  roomAmount      Int     @default(0)
+  tableAmount     Int     @default(0)
+  addOnsAmount    Int     @default(0)
+  taxAmount       Int     @default(0)
+  totalPrice      Int // grand total, tax included
+  /// What the payment rule asked for up front (see lib/pricing.ts).
+  advanceAmount   Int     @default(0)
+  paidAmount      Int     @default(0)
+  remainingAmount Int     @default(0)
+  /// Which payment rule produced advanceAmount, e.g. STANDARD_ADVANCE, SAME_DAY_FULL.
+  paymentRule     String?
+  refundAmount    Int     @default(0)
 
   status          BookingStatus @default(PENDING)
   paymentStatus   PaymentStatus @default(PENDING)
+  refundStatus    RefundStatus  @default(NONE)
   stripePaymentId String?
+
+  confirmedAt       DateTime?
+  refundRequestedAt DateTime?
+  refundProcessedAt DateTime?
+  refundNote        String?
+  adminNotes        String?
 
   // Unpaid ONLINE bookings are auto-released after this instant.
   holdExpiresAt DateTime?
@@ -220,8 +248,12 @@ model Booking {
 
   review         Review?
   managerActions ManagerAction[]
+  payments       Payment[]
+  notifications  NotificationLog[]
 
   @@index([userId])
+  @@index([refundStatus])
+  @@index([createdAt])
   @@index([roomId])
   @@index([tableId])
   @@index([status])
@@ -234,6 +266,122 @@ model Booking {
   @@index([holdExpiresAt])
   // Drives the overlap scan in the availability engine.
   @@index([roomId, status, checkInDate, checkOutDate])
+  @@index([tableId, status, bookingDate])
+}
+
+// ============================================
+// Payments
+// ============================================
+
+/// Ledger of money movements on a booking: the online advance, the balance
+/// collected at the desk, refunds. Booking.paidAmount is the running total.
+model Payment {
+  id               String              @id @default(cuid())
+  bookingId        String
+  kind             PaymentKind
+  status           PaymentRecordStatus @default(CREATED)
+  mode             PaymentMode
+  /// Whole INR. Refunds are stored as positive amounts with kind = REFUND.
+  amount           Int
+  /// RAZORPAY | MOCK | DESK
+  gateway          String
+  /// Unique so a replayed webhook or a double-clicked verify can't apply twice.
+  gatewayOrderId   String?             @unique
+  gatewayPaymentId String?             @unique
+  recordedById     String?
+  notes            String?
+  failureReason    String?
+  paidAt           DateTime?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  booking    Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  recordedBy User?   @relation("PaymentsRecorded", fields: [recordedById], references: [id], onDelete: SetNull)
+
+  @@index([bookingId])
+  @@index([status])
+  @@index([kind])
+  @@index([createdAt])
+}
+
+// ============================================
+// Pricing & policy configuration
+// ============================================
+
+/// Single-row table (id = 1). Read through lib/settings.ts, which creates the
+/// row with these defaults on first use.
+model HotelSettings {
+  id Int @id @default(1)
+
+  /// Normal stays: percentage of the total taken online.
+  advancePercent     Int                @default(50)
+  /// Nights that count as weekend, as JS weekday numbers (0 = Sunday).
+  weekendDays        Int[]              @default([5, 6])
+  /// What a stay touching a weekend / peak / event night pays up front.
+  premiumPaymentRule PremiumPaymentRule @default(FULL)
+  sameDayFullPayment Boolean            @default(true)
+  longStayEnabled    Boolean            @default(true)
+  longStayMinNights  Int                @default(3)
+  gstPercent         Int                @default(0)
+  tablePricePerGuest Int                @default(500)
+
+  /// Cancelled at least this many hours before check-in → earlyRefundPercent.
+  earlyCancelHours   Int @default(48)
+  earlyRefundPercent Int @default(50)
+  /// Cancelled at least this many hours before (but under earlyCancelHours) → lateRefundPercent.
+  lateCancelHours    Int @default(24)
+  lateRefundPercent  Int @default(50)
+  // Anything later than lateCancelHours, or a no-show, refunds nothing.
+
+  updatedAt   DateTime @updatedAt
+  updatedById String?
+}
+
+model PeakSeason {
+  id        String   @id @default(cuid())
+  name      String
+  /// Inclusive date range of nights.
+  startDate DateTime @db.Date
+  endDate   DateTime @db.Date
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([startDate, endDate])
+}
+
+model SpecialDate {
+  id        String   @id @default(cuid())
+  name      String
+  date      DateTime @unique @db.Date
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ============================================
+// Notifications
+// ============================================
+
+model NotificationLog {
+  id        String              @id @default(cuid())
+  bookingId String?
+  channel   NotificationChannel
+  /// BOOKING_CONFIRMED, BOOKING_CANCELLED, REFUND_UPDATE, ...
+  event     String
+  recipient String
+  status    NotificationStatus  @default(PENDING)
+  error     String?
+  attempts  Int                 @default(0)
+  sentAt    DateTime?
+  createdAt DateTime            @default(now())
+  updatedAt DateTime            @updatedAt
+
+  booking Booking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+
+  @@index([bookingId])
+  @@index([status])
+  @@index([channel])
 }
 
 // Append-only audit trail of everything a manager/admin does.
@@ -311,6 +459,7 @@ enum BookingStatus {
 enum BookingType {
   ROOM
   TABLE
+  ROOM_TABLE
 }
 
 enum BookingSource {
@@ -327,9 +476,49 @@ enum PaymentMode {
 
 enum PaymentStatus {
   PENDING
+  PARTIALLY_PAID
   PAID
   FAILED
   REFUNDED
+}
+
+/// Kept apart from PaymentStatus so "how much was paid" and "where is the
+/// refund" never overwrite each other.
+enum RefundStatus {
+  NONE
+  REFUND_PENDING
+  REFUND_PROCESSED
+  REFUND_REJECTED
+}
+
+enum PaymentKind {
+  ADVANCE
+  BALANCE
+  FULL
+  REFUND
+}
+
+enum PaymentRecordStatus {
+  CREATED
+  SUCCEEDED
+  FAILED
+}
+
+enum PremiumPaymentRule {
+  FULL
+  FIRST_NIGHT
+}
+
+enum NotificationChannel {
+  EMAIL
+  WHATSAPP
+  SMS
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
 }
 
 enum ManagerActionType {
@@ -347,4 +536,8 @@ enum ManagerActionType {
   CREATE_TABLE
   UPDATE_TABLE
   DELETE_TABLE
+  RECORD_PAYMENT
+  UPDATE_PAYMENT
+  PROCESS_REFUND
+  UPDATE_SETTINGS
 }

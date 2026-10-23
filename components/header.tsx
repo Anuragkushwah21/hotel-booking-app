@@ -31,7 +31,7 @@ export function Header() {
   // role‑based redirect for profile/admin button
   const handleRoleRedirect = () => {
     if (!user) return
-    if (user.role === 'ADMIN' || user.isAdmin) {
+    if (user.role === 'ADMIN' || user.role === 'HOTEL_MANAGER' || user.isAdmin) {
       router.push('/admin')
     } else {
       router.push('/rooms')
@@ -66,7 +66,7 @@ export function Header() {
               </Link>
             ))}
 
-            {user && (user.role === 'ADMIN' || user.isAdmin) && (
+            {user && (user.role === 'ADMIN' || user.role === 'HOTEL_MANAGER' || user.isAdmin) && (
               <Link
                 href="/admin"
                 className="text-sm font-medium text-primary transition hover:text-primary/80"
@@ -153,7 +153,7 @@ export function Header() {
               My Bookings
             </Link>
 
-            {user && (user.role === 'ADMIN' || user.isAdmin) && (
+            {user && (user.role === 'ADMIN' || user.role === 'HOTEL_MANAGER' || user.isAdmin) && (
               <Link
                 href="/admin"
                 onClick={() => setIsMenuOpen(false)}

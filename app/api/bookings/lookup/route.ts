@@ -1,20 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server'
+import type { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/prisma'
 import { normalizeBookingRef } from '@/lib/booking-reference'
+import { getHotelSettings } from '@/lib/settings'
+import { guestBookingInclude, toGuestBookingView } from '@/lib/booking-view'
 
 /**
- * POST /api/bookings/lookup  { bookingId, email }
+ * POST /api/bookings/lookup  { query }
  *
- * Public booking lookup for guests who have a booking number but no account —
- * chiefly walk-ins created at the front desk, who never set a password.
- *
- * The email is a second factor: the booking number alone is never enough, and
- * a wrong number and a wrong email return the exact same message so this can't
- * be used to probe for who has stayed here.
+ * Guests without an account can look up a booking using one of: booking
+ * number, email address, or mobile number. Email/phone can belong to more
+ * than one booking, so those searches return a list rather than silently
+ * picking an arbitrary stay.
  */
 
-const GENERIC_MISS =
-  "We couldn't find a booking with that booking number and email. Please check both and try again."
+const GENERIC_MISS = "We couldn't find any bookings with those details. Please check and try again."
 
 // Per-instance throttle. Serverless spreads requests across instances so this
 // is a speed bump, not a guarantee — put a real limiter at the edge if abuse shows up.
@@ -35,6 +35,11 @@ function rateLimited(ip: string): boolean {
   return entry.count > MAX_ATTEMPTS
 }
 
+function phoneCandidates(value: string): string[] {
+  const digits = value.replace(/\D/g, '')
+  return [...new Set([value, value.replace(/[\s-]/g, ''), digits, digits ? `+${digits}` : ''])].filter(Boolean)
+}
+
 export async function POST(req: NextRequest) {
   try {
     const ip =
@@ -50,70 +55,62 @@ export async function POST(req: NextRequest) {
     }
 
     const body = await req.json()
-    const bookingId = typeof body?.bookingId === 'string' ? body.bookingId.trim() : ''
-    const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : ''
+    // Keep the old payload fields as a fallback for old links/forms.
+    const query = typeof body?.query === 'string'
+      ? body.query.trim()
+      : typeof body?.bookingId === 'string'
+        ? body.bookingId.trim()
+        : ''
 
-    if (!bookingId || !email) {
+    if (!query) {
       return NextResponse.json(
-        { error: 'Booking number and email are both required' },
+        { error: 'Enter a booking number, email address, or mobile number.' },
         { status: 400 },
       )
     }
 
-    // Guests quote the short reference (HB-7K4M2Q). Older confirmation emails
-    // went out with the raw booking id, so both still resolve.
-    const reference = normalizeBookingRef(bookingId)
+    const reference = normalizeBookingRef(query)
+    const email = query.toLowerCase()
+    const looksLikeEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+    const phones = phoneCandidates(query)
+    const looksLikePhone = phones.some((phone) => phone.replace(/\D/g, '').length >= 7)
 
-    const booking = await prisma.booking.findFirst({
-      where: reference ? { reference } : { id: bookingId },
-      include: {
-        room: { select: { name: true, roomNo: true, acType: true } },
-        table: { select: { tableNo: true, location: true } },
-        user: { select: { email: true } },
-      },
+    const where: Prisma.BookingWhereInput = reference
+      ? { reference }
+      : looksLikeEmail
+        ? {
+            OR: [
+              { guestEmail: { equals: email, mode: 'insensitive' as const } },
+              { user: { is: { email: { equals: email, mode: 'insensitive' as const } } } },
+            ],
+          }
+        : looksLikePhone
+          ? {
+              OR: [
+                { guestPhone: { in: phones } },
+                { user: { is: { phone: { in: phones } } } },
+              ],
+            }
+          : { id: query }
+
+    const bookings = await prisma.booking.findMany({
+      where,
+      include: guestBookingInclude,
+      orderBy: { createdAt: 'desc' },
+      take: 20,
     })
 
-    // Either the booking's own contact email or the account it sits under works.
-    const matches =
-      booking &&
-      (booking.guestEmail?.toLowerCase() === email ||
-        booking.user?.email?.toLowerCase() === email)
-
-    if (!matches) {
+    if (bookings.length === 0) {
       return NextResponse.json({ error: GENERIC_MISS }, { status: 404 })
     }
 
-    return NextResponse.json({
-      success: true,
-      booking: {
-        id: booking.id,
-        reference: booking.reference,
-        type: booking.type,
-        source: booking.source,
-        status: booking.status,
-        paymentStatus: booking.paymentStatus,
-        paymentMode: booking.paymentMode,
-        guestName: booking.guestName,
-        guestCount: booking.guestCount,
-        guestPhone: booking.guestPhone,
-        specialRequest: booking.specialRequest,
-        roomName: booking.room?.name ?? null,
-        roomNo: booking.room?.roomNo ?? null,
-        tableNo: booking.table?.tableNo ?? null,
-        tableLocation: booking.table?.location ?? null,
-        checkInDate: booking.checkInDate?.toISOString() ?? null,
-        checkOutDate: booking.checkOutDate?.toISOString() ?? null,
-        bookingDate: booking.bookingDate?.toISOString() ?? null,
-        checkedInAt: booking.checkedInAt?.toISOString() ?? null,
-        checkedOutAt: booking.checkedOutAt?.toISOString() ?? null,
-        addOns: booking.addOns,
-        baseAmount: booking.baseAmount,
-        addOnsAmount: booking.addOnsAmount,
-        totalPrice: booking.totalPrice,
-        refundAmount: booking.refundAmount,
-        createdAt: booking.createdAt.toISOString(),
-      },
+    const settings = await getHotelSettings()
+    const views = bookings.map((booking) => {
+      const { guestEmail: _email, ...view } = toGuestBookingView(booking, settings)
+      return { ...view, baseAmount: booking.baseAmount }
     })
+
+    return NextResponse.json({ success: true, bookings: views, booking: views[0] })
   } catch (error) {
     console.error('[bookings/lookup] POST error:', error)
     return NextResponse.json({ error: 'Failed to look up booking' }, { status: 500 })

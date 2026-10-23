@@ -1,67 +1,51 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, Suspense } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
+import Link from 'next/link'
 import { toast } from 'react-toastify'
+import {
+  BedDouble, Calendar, KeyRound, Loader2, Mail, MessageSquare, Phone, Search,
+  UtensilsCrossed, Users, X,
+} from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { 
-  Calendar, 
-  MapPin, 
-  Users, 
-  Mail, 
-  Phone, 
-  CreditCard,
-  MessageSquare,
-  Search,
-  X 
-} from 'lucide-react'
+import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle,
+} from '@/components/ui/dialog'
 import { ReviewForm, type BookingReview } from '@/components/site/review-form'
+import { PayButton } from '@/components/site/pay-button'
+import {
+  BookingStatusBadge, PaymentStatusBadge, RefundStatusBadge, bookingTitle,
+} from '@/components/site/booking-badges'
+import { formatDate, formatDateTime, formatINR } from '@/lib/format'
+import type { GuestBookingView } from '@/lib/booking-view'
 
-type BookingStatus = 'PENDING' | 'CONFIRMED' | 'CANCELLED' | 'CHECKED_IN' | 'CHECKED_OUT'
-type PaymentStatus = 'PENDING' | 'PAID' | 'FAILED' | 'REFUNDED'
+type Booking = Omit<GuestBookingView, 'review'> & { review: BookingReview | null }
 
-type Booking = {
-  id: string
-  reference: string
-  type: 'ROOM' | 'TABLE'
-  roomName: string | null
-  roomNo: string | null
-  tableNo: string | null
-  checkInDate: string | null
-  checkOutDate: string | null
-  bookingDate: string | null
-  guestCount: number
-  guestName: string
-  guestEmail: string
-  guestPhone: string | null
-  specialRequest: string | null
-  totalPrice: number
-  status: BookingStatus
-  paymentStatus: PaymentStatus
-  checkedOutAt: string | null
-  canReview: boolean
-  review: BookingReview | null
-  createdAt: string
-}
-
-export default function MyBookingsPage() {
+function MyBookingsContent() {
+  const router = useRouter()
+  const searchParams = useSearchParams()
   const [bookings, setBookings] = useState<Booking[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [cancelling, setCancelling] = useState<string | null>(null)
+  const [toCancel, setToCancel] = useState<Booking | null>(null)
+  const [cancelling, setCancelling] = useState(false)
 
-  const fetchBookings = async () => {
+  const fetchBookings = useCallback(async () => {
     try {
       setLoading(true)
-      const res = await fetch('/api/bookings/me')
+      const res = await fetch('/api/bookings/me', { cache: 'no-store' })
       const data = await res.json()
-      
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to load bookings')
+      if (res.status === 401) {
+        router.replace('/login?next=/bookings')
+        return
       }
-      
+      if (!res.ok) throw new Error(data.error || 'Failed to load bookings')
       setBookings(data.bookings || [])
+      setError('')
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to load bookings'
       setError(message)
@@ -69,11 +53,19 @@ export default function MyBookingsPage() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [router])
 
   useEffect(() => {
-    fetchBookings()
-  }, [])
+    void fetchBookings()
+  }, [fetchBookings])
+
+  // Arriving from checkout / an older payment redirect.
+  useEffect(() => {
+    if (searchParams.get('payment') === 'success' || searchParams.get('booked') === '1') {
+      toast.success('Payment received — your booking is confirmed.', { toastId: 'booked' })
+      router.replace('/bookings')
+    }
+  }, [searchParams, router])
 
   // Fold a freshly saved review back into the list without a refetch
   const handleReviewSaved = (bookingId: string, review: BookingReview) => {
@@ -82,114 +74,49 @@ export default function MyBookingsPage() {
     )
   }
 
-  // Cancel booking handler
- // Cancel booking handler
-const handleCancelBooking = async (bookingId: string, bookingType: 'ROOM' | 'TABLE') => {
-  const confirmed = window.confirm(
-    'Are you sure you want to cancel this booking? This action cannot be undone.'
-  )
-  
-  if (!confirmed) return
-
-  try {
-    setCancelling(bookingId)
-
-    // ✅ FIXED: Removed extra 's' from rooms and tables
-    const endpoint = bookingType === 'ROOM' 
-      ? `/api/bookings/rooms/${bookingId}`      // ✅ room (not rooms)
-      : `/api/bookings/tables/${bookingId}`     // ✅ table (not tables)
-
-    const response = await fetch(endpoint, {
-      method: 'DELETE',
-    })
-
-    const data = await response.json()
-
-    if (!response.ok) {
-      toast.error(data.error || 'Failed to cancel booking')
-      return
+  const confirmCancel = async () => {
+    if (!toCancel) return
+    try {
+      setCancelling(true)
+      const res = await fetch(`/api/bookings/${toCancel.id}/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || 'Failed to cancel booking')
+      toast.success(data.message || 'Booking cancelled')
+      setToCancel(null)
+      void fetchBookings()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Something went wrong. Please try again.')
+    } finally {
+      setCancelling(false)
     }
-
-    toast.success('🎉 Booking cancelled successfully!')
-    
-    // Refresh bookings
-    fetchBookings()
-  } catch (error) {
-    console.error('Error:', error)
-    toast.error('Something went wrong. Please try again.')
-  } finally {
-    setCancelling(null)
-  }
-}
-
-  // Status badge component
-  const StatusBadge = ({ status }: { status: BookingStatus }) => {
-    const colors = {
-      PENDING: 'bg-yellow-100 text-yellow-800 border-yellow-200',
-      CONFIRMED: 'bg-green-100 text-green-800 border-green-200',
-      CANCELLED: 'bg-red-100 text-red-800 border-red-200',
-      CHECKED_IN: 'bg-blue-100 text-blue-800 border-blue-200',
-      CHECKED_OUT: 'bg-purple-100 text-purple-800 border-purple-200',
-    }
-
-    return (
-      <Badge 
-        variant="outline" 
-        className={`${colors[status]} font-semibold`}
-      >
-        {status.replace('_', ' ')}
-      </Badge>
-    )
-  }
-
-  // Payment status badge
-  const PaymentBadge = ({ status }: { status: PaymentStatus }) => {
-    const colors = {
-      PENDING: 'bg-orange-100 text-orange-800',
-      PAID: 'bg-green-100 text-green-800',
-      FAILED: 'bg-red-100 text-red-800',
-      REFUNDED: 'bg-gray-100 text-gray-800',
-    }
-
-    return (
-      <span className={`inline-flex items-center gap-1 px-2 py-1 rounded text-xs font-medium ${colors[status]}`}>
-        <CreditCard className="h-3 w-3" />
-        {status}
-      </span>
-    )
   }
 
   if (loading) {
     return (
-      <div className="max-w-5xl mx-auto py-10 px-4">
-        <div className="space-y-4">
-          {[1, 2, 3].map((i) => (
-            <Card key={i} className="p-6 animate-pulse">
-              <div className="h-6 bg-gray-200 rounded w-1/3 mb-4"></div>
-              <div className="h-4 bg-gray-200 rounded w-1/2 mb-2"></div>
-              <div className="h-4 bg-gray-200 rounded w-2/3"></div>
-            </Card>
-          ))}
-        </div>
+      <div className="mx-auto max-w-5xl space-y-4 px-4 py-10">
+        <Skeleton className="h-10 w-48" />
+        {[1, 2, 3].map((i) => (
+          <Skeleton key={i} className="h-48 rounded-xl" />
+        ))}
       </div>
     )
   }
 
   if (error) {
     return (
-      <div className="max-w-5xl mx-auto py-10 px-4">
+      <div className="mx-auto max-w-5xl px-4 py-10">
         <Card className="p-10 text-center">
-          <p className="text-red-500 text-lg font-semibold mb-2">Error</p>
+          <p className="mb-2 text-lg font-semibold text-destructive">Error</p>
           <p className="text-muted-foreground">{error}</p>
-          <div className="flex flex-wrap items-center justify-center gap-2 mt-4">
-            <Button onClick={fetchBookings}>Try Again</Button>
+          <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
+            <Button onClick={fetchBookings}>Try again</Button>
             {/* Signed-out or front-desk guests can still get to their booking. */}
-            <Button
-              variant="outline"
-              onClick={() => (window.location.href = '/booking-status')}
-            >
-              <Search className="h-4 w-4 mr-2" />
-              See your booking
+            <Button variant="outline" asChild>
+              <Link href="/booking-status"><Search className="mr-2 h-4 w-4" />See your booking</Link>
             </Button>
           </div>
         </Card>
@@ -199,25 +126,22 @@ const handleCancelBooking = async (bookingId: string, bookingType: 'ROOM' | 'TAB
 
   if (bookings.length === 0) {
     return (
-      <div className="max-w-5xl mx-auto py-10 px-4">
+      <div className="mx-auto max-w-5xl px-4 py-10">
         <Card className="p-10 text-center">
-          <p className="text-lg font-semibold mb-2">No bookings yet</p>
-          <p className="text-muted-foreground mb-4">
-            You haven't made any bookings. Start exploring rooms and tables!
+          <BedDouble className="mx-auto mb-3 h-8 w-8 text-muted-foreground" aria-hidden />
+          <p className="mb-2 text-lg font-semibold">No bookings yet</p>
+          <p className="mb-4 text-muted-foreground">
+            You haven&apos;t made any bookings. Start exploring rooms and tables!
           </p>
-          <Button onClick={() => window.location.href = '/rooms'}>
-            Browse Rooms
-          </Button>
-          <p className="text-sm text-muted-foreground mt-6 mb-3">
-            Booked at our front desk? Those don't appear here — look it up with
-            your booking number.
+          <div className="flex flex-wrap justify-center gap-2">
+            <Button asChild><Link href="/rooms">Browse rooms</Link></Button>
+            <Button variant="outline" asChild><Link href="/tables/reserve">Reserve a table</Link></Button>
+          </div>
+          <p className="mb-3 mt-6 text-sm text-muted-foreground">
+            Booked at our front desk? Those don&apos;t appear here — look it up with your booking number.
           </p>
-          <Button
-            variant="outline"
-            onClick={() => (window.location.href = '/booking-status')}
-          >
-            <Search className="h-4 w-4 mr-2" />
-            See your booking
+          <Button variant="outline" asChild>
+            <Link href="/booking-status"><Search className="mr-2 h-4 w-4" />See your booking</Link>
           </Button>
         </Card>
       </div>
@@ -225,189 +149,121 @@ const handleCancelBooking = async (bookingId: string, bookingType: 'ROOM' | 'TAB
   }
 
   return (
-    <div className="max-w-5xl mx-auto py-10 px-4 space-y-6">
-      {/* Header */}
+    <div className="mx-auto max-w-5xl space-y-6 px-4 py-10">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold">My Bookings</h1>
-          <p className="text-muted-foreground mt-1">
-            Manage and view all your bookings
-          </p>
+          <p className="mt-1 text-muted-foreground">Manage and view all your bookings</p>
         </div>
-        <Badge variant="secondary" className="text-lg px-4 py-2">
+        <Badge variant="secondary" className="px-4 py-2 text-lg">
           {bookings.length} {bookings.length === 1 ? 'Booking' : 'Bookings'}
         </Badge>
       </div>
 
       {/* Walk-in bookings live on the front desk's records, not here. */}
-      <Card className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+      <Card className="flex flex-col justify-between gap-3 p-4 sm:flex-row sm:items-center">
         <p className="text-sm text-muted-foreground">
           This list covers the bookings you made online. Booked at our front desk?
           Look it up with your booking number.
         </p>
-        <Button
-          variant="outline"
-          className="shrink-0"
-          onClick={() => (window.location.href = '/booking-status')}
-        >
-          <Search className="h-4 w-4 mr-2" />
-          See your booking
+        <Button variant="outline" className="shrink-0" asChild>
+          <Link href="/booking-status"><Search className="mr-2 h-4 w-4" />See your booking</Link>
         </Button>
       </Card>
 
-      {/* Bookings List */}
       <div className="space-y-4">
         {bookings.map((booking) => {
-          const canCancel = booking.status === 'PENDING' || booking.status === 'CONFIRMED'
-          const showReview = booking.status === 'CHECKED_OUT'
+          const hasRoom = booking.type === 'ROOM' || booking.type === 'ROOM_TABLE'
+          const hasTable = booking.type === 'TABLE' || booking.type === 'ROOM_TABLE'
 
           return (
             <Card key={booking.id} className="overflow-hidden">
-              <div className="p-6 space-y-4">
+              <div className="space-y-4 p-6">
                 {/* Header Row */}
-                <div className="flex items-start justify-between">
-                  <div className="flex-1">
-                    <div className="flex items-center gap-3 mb-2">
-                      <h3 className="text-xl font-bold">
-                        {booking.type === 'ROOM' 
-                          ? booking.roomName || 'Room Booking'
-                          : `Table ${booking.tableNo || 'Booking'}`}
-                      </h3>
-                      <StatusBadge status={booking.status} />
-                      <PaymentBadge status={booking.paymentStatus} />
+                <div className="flex flex-wrap items-start justify-between gap-4">
+                  <div className="min-w-0 flex-1">
+                    <div className="mb-2 flex flex-wrap items-center gap-2">
+                      <h3 className="text-xl font-bold">{bookingTitle(booking)}</h3>
+                      <BookingStatusBadge status={booking.status} />
+                      <PaymentStatusBadge status={booking.paymentStatus} />
+                      <RefundStatusBadge status={booking.refundStatus} />
                     </div>
-                    
                     <p className="text-sm text-muted-foreground">
                       Booking number:{' '}
                       <span className="font-mono font-semibold tracking-wider text-foreground">
                         {booking.reference}
                       </span>
                     </p>
-
-                    {booking.type === 'ROOM' && booking.roomNo && (
-                      <p className="text-sm text-muted-foreground flex items-center gap-2 mt-1">
-                        <MapPin className="h-4 w-4" />
-                        Room #{booking.roomNo}
+                    {hasRoom && booking.roomNo && (
+                      <p className="mt-1 flex items-center gap-2 text-sm font-medium">
+                        <KeyRound className="h-4 w-4 text-primary" aria-hidden />
+                        Room {booking.roomNo}
                       </p>
                     )}
                   </div>
 
                   <div className="text-right">
-                    <p className="text-2xl font-bold text-primary">
-                      ₹{booking.totalPrice.toLocaleString()}
+                    <p className="text-2xl font-bold text-primary tabular-nums">{formatINR(booking.totalPrice)}</p>
+                    <p className="text-xs text-muted-foreground">Total</p>
+                    <p className="mt-1 text-sm tabular-nums">
+                      Paid <span className="font-semibold">{formatINR(booking.paidAmount)}</span>
                     </p>
-                    <p className="text-xs text-muted-foreground">
-                      Total Amount
-                    </p>
+                    {booking.remainingAmount > 0 && booking.status !== 'CANCELLED' && (
+                      <p className="text-sm tabular-nums text-amber-700">
+                        Due at check-in {formatINR(booking.remainingAmount)}
+                      </p>
+                    )}
+                    {booking.refundAmount > 0 && (
+                      <p className="text-sm tabular-nums text-violet-700">
+                        Refund {formatINR(booking.refundAmount)}
+                      </p>
+                    )}
                   </div>
                 </div>
 
                 {/* Details Grid */}
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-4 border-t">
-                  {/* Dates */}
-                  {booking.type === 'ROOM' && booking.checkInDate && booking.checkOutDate && (
-                    <div className="flex items-start gap-3">
-                      <Calendar className="h-5 w-5 text-muted-foreground mt-0.5" />
-                      <div>
-                        <p className="text-sm font-medium">Check-in & Check-out</p>
-                        <p className="text-sm text-muted-foreground">
-                          {new Date(booking.checkInDate).toLocaleDateString('en-IN', {
-                            day: 'numeric',
-                            month: 'short',
-                            year: 'numeric',
-                          })}
-                          {' → '}
-                          {new Date(booking.checkOutDate).toLocaleDateString('en-IN', {
-                            day: 'numeric',
-                            month: 'short',
-                            year: 'numeric',
-                          })}
-                        </p>
-                      </div>
-                    </div>
+                <div className="grid grid-cols-1 gap-4 border-t pt-4 md:grid-cols-2">
+                  {hasRoom && booking.checkInDate && booking.checkOutDate && (
+                    <Detail icon={Calendar} label="Check-in & Check-out">
+                      {formatDate(booking.checkInDate)} → {formatDate(booking.checkOutDate)}
+                    </Detail>
                   )}
-
-                  {booking.type === 'TABLE' && booking.bookingDate && (
-                    <div className="flex items-start gap-3">
-                      <Calendar className="h-5 w-5 text-muted-foreground mt-0.5" />
-                      <div>
-                        <p className="text-sm font-medium">Dining Date & Time</p>
-                        <p className="text-sm text-muted-foreground">
-                          {new Date(booking.bookingDate).toLocaleString('en-IN', {
-                            day: 'numeric',
-                            month: 'short',
-                            year: 'numeric',
-                            hour: '2-digit',
-                            minute: '2-digit',
-                          })}
-                        </p>
-                      </div>
-                    </div>
+                  {hasTable && booking.bookingDate && (
+                    <Detail icon={UtensilsCrossed} label={`Table ${booking.tableNo ?? ''}`.trim()}>
+                      {formatDateTime(booking.bookingDate)}
+                      {booking.tableLocation ? ` · ${booking.tableLocation}` : ''}
+                      {' · '}{booking.tableGuestCount ?? booking.guestCount} diner
+                      {(booking.tableGuestCount ?? booking.guestCount) === 1 ? '' : 's'}
+                    </Detail>
                   )}
-
-                  {/* Guests */}
-                  <div className="flex items-start gap-3">
-                    <Users className="h-5 w-5 text-muted-foreground mt-0.5" />
-                    <div>
-                      <p className="text-sm font-medium">Guests</p>
-                      <p className="text-sm text-muted-foreground">
-                        {booking.guestCount} {booking.guestCount === 1 ? 'Guest' : 'Guests'}
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Guest Name */}
-                  <div className="flex items-start gap-3">
-                    <Users className="h-5 w-5 text-muted-foreground mt-0.5" />
-                    <div>
-                      <p className="text-sm font-medium">Guest Name</p>
-                      <p className="text-sm text-muted-foreground">
-                        {booking.guestName}
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Email */}
-                  <div className="flex items-start gap-3">
-                    <Mail className="h-5 w-5 text-muted-foreground mt-0.5" />
-                    <div>
-                      <p className="text-sm font-medium">Email</p>
-                      <p className="text-sm text-muted-foreground">
-                        {booking.guestEmail}
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Phone */}
-                  {booking.guestPhone && (
-                    <div className="flex items-start gap-3">
-                      <Phone className="h-5 w-5 text-muted-foreground mt-0.5" />
-                      <div>
-                        <p className="text-sm font-medium">Phone</p>
-                        <p className="text-sm text-muted-foreground">
-                          {booking.guestPhone}
-                        </p>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Special Request */}
+                  <Detail icon={Users} label="Guests">
+                    {booking.guestName} · {booking.guestCount} {booking.guestCount === 1 ? 'guest' : 'guests'}
+                  </Detail>
+                  <Detail icon={Mail} label="Email">{booking.guestEmail}</Detail>
+                  {booking.guestPhone && <Detail icon={Phone} label="Phone">{booking.guestPhone}</Detail>}
                   {booking.specialRequest && (
-                    <div className="flex items-start gap-3 md:col-span-2">
-                      <MessageSquare className="h-5 w-5 text-muted-foreground mt-0.5" />
-                      <div>
-                        <p className="text-sm font-medium">Special Request</p>
-                        <p className="text-sm text-muted-foreground">
-                          {booking.specialRequest}
-                        </p>
-                      </div>
-                    </div>
+                    <Detail icon={MessageSquare} label="Special request" wide>{booking.specialRequest}</Detail>
+                  )}
+                  {booking.status === 'CANCELLED' && booking.cancelReason && (
+                    <Detail icon={X} label="Cancellation" wide>
+                      {booking.cancelReason}
+                      {booking.refundNote ? ` — ${booking.refundNote}` : ''}
+                    </Detail>
                   )}
                 </div>
 
+                {booking.awaitingPayment && (
+                  <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3">
+                    <p className="text-sm text-amber-900">
+                      Payment not completed. Pay {formatINR(booking.advanceAmount || booking.totalPrice)} to confirm.
+                    </p>
+                    <PayButton bookingId={booking.id} amount={booking.advanceAmount || booking.totalPrice} size="sm" label="Complete payment" />
+                  </div>
+                )}
+
                 {/* Post-stay review */}
-                {showReview && (
-                  <div className="pt-4 border-t">
+                {booking.status === 'CHECKED_OUT' && (
+                  <div className="border-t pt-4">
                     <ReviewForm
                       bookingId={booking.id}
                       review={booking.review}
@@ -417,38 +273,91 @@ const handleCancelBooking = async (bookingId: string, bookingType: 'ROOM' | 'TAB
                 )}
 
                 {/* Footer */}
-                <div className="flex items-center justify-between pt-4 border-t">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-t pt-4">
                   <p className="text-xs text-muted-foreground">
-                    Booked on {new Date(booking.createdAt).toLocaleDateString('en-IN', {
-                      day: 'numeric',
-                      month: 'short',
-                      year: 'numeric',
-                    })}
+                    Booked on {formatDate(booking.createdAt)}
+                    {booking.paymentRuleLabel ? ` · ${booking.paymentRuleLabel}` : ''}
                   </p>
-
-                  {canCancel && (
-                    <Button
-                      variant="destructive"
-                      size="sm"
-                      onClick={() => handleCancelBooking(booking.id, booking.type)}
-                      disabled={cancelling === booking.id}
-                    >
-                      {cancelling === booking.id ? (
-                        'Cancelling...'
-                      ) : (
-                        <>
-                          <X className="h-4 w-4 mr-2" />
-                          Cancel Booking
-                        </>
-                      )}
-                    </Button>
-                  )}
+                  <div className="flex gap-2">
+                    {booking.status !== 'PENDING' && booking.status !== 'CANCELLED' && (
+                      <Button variant="outline" size="sm" asChild>
+                        <Link href={`/booking-confirmed/${booking.id}`}>View details</Link>
+                      </Button>
+                    )}
+                    {booking.canCancel && (
+                      <Button variant="destructive" size="sm" onClick={() => setToCancel(booking)}>
+                        <X className="mr-2 h-4 w-4" aria-hidden />
+                        Cancel booking
+                      </Button>
+                    )}
+                  </div>
                 </div>
               </div>
             </Card>
           )
         })}
       </div>
+
+      <Dialog open={!!toCancel} onOpenChange={(open) => !open && !cancelling && setToCancel(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Cancel booking {toCancel?.reference}?</DialogTitle>
+            <DialogDescription>
+              {toCancel?.refundPreview
+                ? toCancel.refundPreview.message
+                : toCancel && toCancel.paidAmount > 0
+                  ? 'Under our cancellation policy this booking is not eligible for a refund.'
+                  : 'Nothing has been paid, so there is nothing to refund.'}{' '}
+              This cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+            <Button variant="outline" disabled={cancelling} onClick={() => setToCancel(null)}>
+              Keep booking
+            </Button>
+            <Button variant="destructive" disabled={cancelling} onClick={confirmCancel}>
+              {cancelling ? <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden /> : null}
+              Yes, cancel
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
+  )
+}
+
+function Detail({
+  icon: IconCmp,
+  label,
+  children,
+  wide,
+}: {
+  icon: React.ComponentType<{ className?: string }>
+  label: string
+  children: React.ReactNode
+  wide?: boolean
+}) {
+  return (
+    <div className={`flex items-start gap-3 ${wide ? 'md:col-span-2' : ''}`}>
+      <IconCmp className="mt-0.5 h-5 w-5 text-muted-foreground" />
+      <div>
+        <p className="text-sm font-medium">{label}</p>
+        <p className="text-sm text-muted-foreground">{children}</p>
+      </div>
+    </div>
+  )
+}
+
+export default function MyBookingsPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex min-h-[50vh] items-center justify-center text-muted-foreground">
+          <Loader2 className="mr-2 h-5 w-5 animate-spin" />Loading bookings…
+        </div>
+      }
+    >
+      <MyBookingsContent />
+    </Suspense>
   )
 }

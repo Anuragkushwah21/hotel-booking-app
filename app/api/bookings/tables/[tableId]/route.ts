@@ -2,6 +2,9 @@ import { NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
 import { cookies } from 'next/headers'
 import { getSessionByToken } from '@/lib/auth'
+import { BookingError } from '@/lib/booking-engine'
+import { cancelBooking } from '@/lib/cancellation'
+import { dispatchNotifications, notifySafely } from '@/lib/notifications'
 
 // ✅ GET single table booking
 export async function GET(
@@ -32,7 +35,7 @@ export async function GET(
     const booking = await prisma.booking.findUnique({
       where: { 
         id,
-        type: 'TABLE',
+        type: { in: ['TABLE', 'ROOM_TABLE'] },
       },
       include: {
         table: {
@@ -75,149 +78,40 @@ export async function GET(
 }
 
 // ✅ DELETE/CANCEL table booking (ONLY FOR USERS)
+/**
+ * DELETE — guest cancels their own table booking.
+ * Same policy and refund handling as POST /api/bookings/[id]/cancel.
+ */
 export async function DELETE(
-  req: Request,
+  _req: Request,
   { params }: { params: Promise<{ tableId: string }> }
 ) {
+  const token = (await cookies()).get('session_token')?.value
+  const session = token ? await getSessionByToken(token) : null
+  if (!session) {
+    return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
+  }
+
   try {
-    const cookieStore = await cookies()
-    const token = cookieStore.get('session_token')?.value
-
-    if (!token) {
-      return NextResponse.json(
-        { error: 'Not authenticated' },
-        { status: 401 }
-      )
-    }
-
-    const session = await getSessionByToken(token)
-    if (!session) {
-      return NextResponse.json(
-        { error: 'Session expired' },
-        { status: 401 }
-      )
-    }
-
     const { tableId: id } = await params
-
-    console.log('📥 User cancel table booking request:', id)
-
-    // Get current booking
-    const booking = await prisma.booking.findUnique({
-      where: { 
-        id,
-        type: 'TABLE',
-      },
-      include: {
-        table: {
-          select: {
-            id: true,
-            tableNo: true,
-          },
-        },
-      },
+    const { booking, refund, notificationIds } = await cancelBooking({
+      actor: 'GUEST',
+      userId: session.userId,
+      bookingId: id,
     })
+    notifySafely(() => dispatchNotifications(notificationIds))
 
-    if (!booking) {
-      return NextResponse.json(
-        { error: 'Table booking not found' },
-        { status: 404 }
-      )
-    }
-
-    // ✅ Only the user who created the booking can cancel it
-    if (booking.userId !== session.userId) {
-      return NextResponse.json(
-        { error: 'You can only cancel your own bookings' },
-        { status: 403 }
-      )
-    }
-
-    // Check if already cancelled
-    if (booking.status === 'CANCELLED') {
-      return NextResponse.json(
-        { error: 'Booking is already cancelled' },
-        { status: 400 }
-      )
-    }
-
-    // Cannot cancel if checked-in
-    if (booking.status === 'CHECKED_IN') {
-      return NextResponse.json(
-        { error: 'Cannot cancel a booking that is already checked-in' },
-        { status: 400 }
-      )
-    }
-
-    // Cannot cancel if checked-out
-    if (booking.status === 'CHECKED_OUT') {
-      return NextResponse.json(
-        { error: 'Cannot cancel a completed booking' },
-        { status: 400 }
-      )
-    }
-
-    // ✅ Cancellation policy - 2 hours before booking time
-    if (booking.status === 'CONFIRMED' && booking.bookingDate) {
-      const bookingDateTime = new Date(booking.bookingDate)
-      const now = new Date()
-      const hoursUntilBooking = (bookingDateTime.getTime() - now.getTime()) / (1000 * 60 * 60)
-
-      // Cannot cancel within 2 hours of booking time
-      if (hoursUntilBooking < 2 && hoursUntilBooking > 0) {
-        return NextResponse.json(
-          { error: 'Cannot cancel table booking within 2 hours of reservation time. Please contact support.' },
-          { status: 400 }
-        )
-      }
-
-      // Cannot cancel if booking time has passed
-      if (hoursUntilBooking < 0) {
-        return NextResponse.json(
-          { error: 'Cannot cancel a past booking' },
-          { status: 400 }
-        )
-      }
-    }
-
-    // Cancel the booking
-    const cancelledBooking = await prisma.booking.update({
-      where: { id },
-      data: { 
-        status: 'CANCELLED',
-        updatedAt: new Date(),
-      },
+    return NextResponse.json({
+      message: refund > 0
+        ? `Booking cancelled. A refund of ₹${refund.toLocaleString('en-IN')} has been requested.`
+        : 'Booking cancelled successfully',
+      booking: { id: booking.id, status: booking.status, refundAmount: booking.refundAmount, refundStatus: booking.refundStatus },
     })
-
-    console.log('✅ Table booking cancelled by user:', cancelledBooking.id)
-
-    return NextResponse.json(
-      { 
-        message: 'Table booking cancelled successfully',
-        booking: {
-          id: cancelledBooking.id,
-          status: cancelledBooking.status,
-          tableNo: (booking as any).table?.tableNo || 'N/A',
-        },
-      },
-      { status: 200 }
-    )
-  } catch (error: any) {
+  } catch (error) {
+    if (error instanceof BookingError) {
+      return NextResponse.json({ error: error.message }, { status: error.status })
+    }
     console.error('[bookings/table/id] DELETE error:', error)
-
-    if (error.code === 'P2025') {
-      return NextResponse.json(
-        { error: 'Table booking not found' },
-        { status: 404 }
-      )
-    }
-
-    return NextResponse.json(
-      { 
-        error: 'Failed to cancel table booking',
-        details: process.env.NODE_ENV === 'development' ? error.message : undefined,
-      },
-      { status: 500 }
-    )
+    return NextResponse.json({ error: 'Failed to cancel booking' }, { status: 500 })
   }
 }

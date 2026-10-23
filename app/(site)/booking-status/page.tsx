@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
+import Link from 'next/link'
 import { toast } from 'react-toastify'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -18,12 +19,12 @@ import {
 } from 'lucide-react'
 
 type BookingStatus = 'PENDING' | 'CONFIRMED' | 'CANCELLED' | 'CHECKED_IN' | 'CHECKED_OUT'
-type PaymentStatus = 'PENDING' | 'PAID' | 'FAILED' | 'REFUNDED'
+type PaymentStatus = 'PENDING' | 'PARTIALLY_PAID' | 'PAID' | 'FAILED' | 'REFUNDED'
 
 type LookupResult = {
   id: string
   reference: string
-  type: 'ROOM' | 'TABLE'
+  type: 'ROOM' | 'TABLE' | 'ROOM_TABLE'
   source: 'ONLINE' | 'WALK_IN'
   status: BookingStatus
   paymentStatus: PaymentStatus
@@ -59,6 +60,7 @@ const STATUS_COLORS: Record<BookingStatus, string> = {
 
 const PAYMENT_COLORS: Record<PaymentStatus, string> = {
   PENDING: 'bg-orange-100 text-orange-800',
+  PARTIALLY_PAID: 'bg-amber-100 text-amber-800',
   PAID: 'bg-green-100 text-green-800',
   FAILED: 'bg-red-100 text-red-800',
   REFUNDED: 'bg-gray-100 text-gray-800',
@@ -77,22 +79,23 @@ const dateTime = (value: string) =>
   })
 
 export default function BookingStatusPage() {
-  const [bookingId, setBookingId] = useState('')
-  const [email, setEmail] = useState('')
+  const [query, setQuery] = useState('')
+  const [bookings, setBookings] = useState<LookupResult[]>([])
   const [booking, setBooking] = useState<LookupResult | null>(null)
+  const [showMore, setShowMore] = useState(false)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
   // The confirmation email links here with ?ref=<booking number> prefilled.
   useEffect(() => {
     const ref = new URLSearchParams(window.location.search).get('ref')
-    if (ref) setBookingId(ref)
+    if (ref) setQuery(ref)
   }, [])
 
   const lookup = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!bookingId.trim() || !email.trim()) {
-      toast.error('Please enter both your booking number and email')
+    if (!query.trim()) {
+      toast.error('Enter your booking number, email, or mobile number')
       return
     }
 
@@ -100,11 +103,13 @@ export default function BookingStatusPage() {
       setLoading(true)
       setError('')
       setBooking(null)
+      setBookings([])
+      setShowMore(false)
 
       const res = await fetch('/api/bookings/lookup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ bookingId: bookingId.trim(), email: email.trim() }),
+        body: JSON.stringify({ query: query.trim() }),
       })
       const data = await res.json()
 
@@ -113,7 +118,9 @@ export default function BookingStatusPage() {
         return
       }
 
-      setBooking(data.booking)
+      const matches: LookupResult[] = data.bookings ?? (data.booking ? [data.booking] : [])
+      setBookings(matches)
+      setBooking(matches[0] ?? null)
     } catch (err) {
       console.error('Error:', err)
       setError('Something went wrong. Please try again.')
@@ -127,33 +134,20 @@ export default function BookingStatusPage() {
       <div>
         <h1 className="text-3xl font-bold">Check your booking</h1>
         <p className="text-muted-foreground mt-1">
-          Enter the booking number from your confirmation email (it looks like
-          HB-7K4M2Q) — no account needed.
+          Enter your booking number, email address, or mobile number — no account needed.
         </p>
       </div>
 
       <Card className="p-6">
         <form onSubmit={lookup} className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="bookingId">Booking number</Label>
+            <Label htmlFor="booking-search">Booking details</Label>
             <Input
-              id="bookingId"
-              placeholder="e.g. HB-7K4M2Q"
-              value={bookingId}
+              id="booking-search"
+              placeholder="Booking no., email, or mobile number"
+              value={query}
               disabled={loading}
-              onChange={(e) => setBookingId(e.target.value)}
-            />
-          </div>
-
-          <div className="space-y-2">
-            <Label htmlFor="email">Email on the booking</Label>
-            <Input
-              id="email"
-              type="email"
-              placeholder="you@example.com"
-              value={email}
-              disabled={loading}
-              onChange={(e) => setEmail(e.target.value)}
+              onChange={(e) => setQuery(e.target.value)}
             />
           </div>
 
@@ -168,6 +162,32 @@ export default function BookingStatusPage() {
         <Card className="p-6 text-center">
           <p className="text-red-500 font-semibold mb-1">Not found</p>
           <p className="text-sm text-muted-foreground">{error}</p>
+        </Card>
+      )}
+
+      {bookings.length > 1 && (
+        <Card className="p-4">
+          <p className="mb-3 text-sm font-medium">{bookings.length} bookings found — select one to view details.</p>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {bookings.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => {
+                  setBooking(item)
+                  setShowMore(false)
+                }}
+                className={`rounded-lg border p-3 text-left text-sm transition hover:border-primary ${
+                  booking?.id === item.id ? 'border-primary bg-primary/5' : 'border-border'
+                }`}
+              >
+                <span className="block font-mono font-semibold">{item.reference}</span>
+                <span className="mt-1 block text-muted-foreground">
+                  {item.type === 'TABLE' ? `Table ${item.tableNo ?? ''}` : item.roomName ?? 'Room booking'} · {date(item.createdAt)}
+                </span>
+              </button>
+            ))}
+          </div>
         </Card>
       )}
 
@@ -202,14 +222,14 @@ export default function BookingStatusPage() {
                   </span>
                 </p>
 
-                {booking.type === 'ROOM' && booking.roomNo && (
+                {booking.type !== 'TABLE' && booking.roomNo && (
                   <p className="text-sm text-muted-foreground flex items-center gap-2 mt-1">
                     <MapPin className="h-4 w-4" />
                     Room #{booking.roomNo}
                   </p>
                 )}
 
-                {booking.type === 'TABLE' && booking.tableLocation && (
+                {booking.type !== 'ROOM' && booking.tableLocation && (
                   <p className="text-sm text-muted-foreground flex items-center gap-2 mt-1">
                     <MapPin className="h-4 w-4" />
                     {booking.tableLocation}
@@ -226,7 +246,7 @@ export default function BookingStatusPage() {
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-4 border-t">
-              {booking.type === 'ROOM' && booking.checkInDate && booking.checkOutDate && (
+              {booking.type !== 'TABLE' && booking.checkInDate && booking.checkOutDate && (
                 <div className="flex items-start gap-3">
                   <Calendar className="h-5 w-5 text-muted-foreground mt-0.5" />
                   <div>
@@ -238,7 +258,7 @@ export default function BookingStatusPage() {
                 </div>
               )}
 
-              {booking.type === 'TABLE' && booking.bookingDate && (
+              {booking.type !== 'ROOM' && booking.bookingDate && (
                 <div className="flex items-start gap-3">
                   <Calendar className="h-5 w-5 text-muted-foreground mt-0.5" />
                   <div>
@@ -269,39 +289,51 @@ export default function BookingStatusPage() {
                 </div>
               )}
 
-              {booking.addOns.length > 0 && (
-                <div className="flex items-start gap-3">
-                  <CreditCard className="h-5 w-5 text-muted-foreground mt-0.5" />
-                  <div>
-                    <p className="text-sm font-medium">Add-ons</p>
-                    <p className="text-sm text-muted-foreground">
-                      {booking.addOns.join(', ')} (₹{booking.addOnsAmount.toLocaleString()})
-                    </p>
-                  </div>
-                </div>
-              )}
-
-              {booking.specialRequest && (
-                <div className="flex items-start gap-3 md:col-span-2">
-                  <MessageSquare className="h-5 w-5 text-muted-foreground mt-0.5" />
-                  <div>
-                    <p className="text-sm font-medium">Special Request</p>
-                    <p className="text-sm text-muted-foreground">{booking.specialRequest}</p>
-                  </div>
-                </div>
-              )}
             </div>
 
-            <div className="pt-4 border-t text-xs text-muted-foreground space-y-1">
-              <p>
-                Booked on {date(booking.createdAt)}
-                {booking.source === 'WALK_IN' ? ' at our front desk' : ' online'}
-              </p>
-              {booking.checkedInAt && <p>Checked in: {dateTime(booking.checkedInAt)}</p>}
-              {booking.checkedOutAt && <p>Checked out: {dateTime(booking.checkedOutAt)}</p>}
-              {booking.refundAmount > 0 && (
-                <p>Refund issued: ₹{booking.refundAmount.toLocaleString()}</p>
-              )}
+            {showMore && (
+              <div className="grid grid-cols-1 gap-4 border-t pt-4 text-sm md:grid-cols-2">
+                <div className="space-y-1 text-muted-foreground">
+                  <p>Booked on {date(booking.createdAt)}{booking.source === 'WALK_IN' ? ' at our front desk' : ' online'}</p>
+                  <p>Base amount: ₹{booking.baseAmount.toLocaleString()}</p>
+                  {booking.addOnsAmount > 0 && <p>Add-ons amount: ₹{booking.addOnsAmount.toLocaleString()}</p>}
+                  {booking.refundAmount > 0 && <p>Refund issued: ₹{booking.refundAmount.toLocaleString()}</p>}
+                  {booking.checkedInAt && <p>Checked in: {dateTime(booking.checkedInAt)}</p>}
+                  {booking.checkedOutAt && <p>Checked out: {dateTime(booking.checkedOutAt)}</p>}
+                </div>
+                <div className="space-y-3">
+                  {booking.addOns.length > 0 && (
+                    <div className="flex items-start gap-3">
+                      <CreditCard className="h-5 w-5 text-muted-foreground mt-0.5" />
+                      <div>
+                        <p className="font-medium">Add-ons</p>
+                        <p className="text-muted-foreground">{booking.addOns.join(', ')}</p>
+                      </div>
+                    </div>
+                  )}
+                  {booking.specialRequest && (
+                    <div className="flex items-start gap-3">
+                      <MessageSquare className="h-5 w-5 text-muted-foreground mt-0.5" />
+                      <div>
+                        <p className="font-medium">Special request</p>
+                        <p className="text-muted-foreground">{booking.specialRequest}</p>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            <div className="flex flex-wrap gap-2 border-t pt-4">
+              <Button type="button" variant="outline" onClick={() => setShowMore((visible) => !visible)}>
+                {showMore ? 'Hide details' : 'View more details'}
+              </Button>
+              <Button type="button" asChild>
+                <Link href="/rooms">Book a room</Link>
+              </Button>
+              <Button type="button" variant="secondary" asChild>
+                <Link href="/tables/reserve">Reserve a table</Link>
+              </Button>
             </div>
           </div>
         </Card>

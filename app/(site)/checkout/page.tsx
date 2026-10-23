@@ -1,471 +1,408 @@
 'use client'
 
-import { useSearchParams, useRouter } from 'next/navigation'
-import { useEffect, useState, Suspense } from 'react'
+import { useEffect, useMemo, useState, Suspense } from 'react'
+import { useSearchParams } from 'next/navigation'
 import Link from 'next/link'
-import { Card } from '@/components/ui/card'
+import { z } from 'zod'
+import { toast } from 'react-toastify'
+import {
+  ArrowLeft, BedDouble, CalendarDays, Clock, Loader2, Lock, UtensilsCrossed, Users, AlertCircle,
+} from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { Card } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
-import { StripePayment } from '@/components/stripe-payment'
-import { ArrowRight, CheckCircle } from 'lucide-react'
+import { Label } from '@/components/ui/label'
+import { Textarea } from '@/components/ui/textarea'
+import { Skeleton } from '@/components/ui/skeleton'
+import { useAuth } from '@/components/auth-provider'
+import { PayButton } from '@/components/site/pay-button'
+import { PriceSummary, PolicyList, slotLabel } from '@/components/site/price-summary'
+import { formatDate, formatINR } from '@/lib/format'
+import { HOTEL } from '@/lib/hotel'
+import type { Quote } from '@/lib/pricing'
 
-interface Room {
+/**
+ * Checkout — guest details, combined invoice, then payment.
+ *
+ *   Room:       /checkout?roomId&checkIn&checkOut&guests[&addOns=a,b][&tableDate&tableTime&tableGuests]
+ *   Table only: /checkout?type=table&date&time&guests
+ *
+ * Submitting creates a short payment hold (POST /api/bookings/rooms|tables);
+ * the booking confirms itself as soon as the payment succeeds.
+ */
+
+const guestForm = z.object({
+  guestName: z.string().trim().min(2, 'Please enter the guest name'),
+  guestEmail: z.string().trim().email('Please enter a valid email'),
+  guestPhone: z
+    .string()
+    .trim()
+    .refine((v) => v === '' || /^[+\d][\d\s-]{7,16}$/.test(v), 'Please enter a valid phone number'),
+  specialRequest: z.string().trim().max(1000, 'Special requests can be up to 1000 characters'),
+})
+
+type RoomInfo = { id: string; name: string; roomNo: string; type: string | null; acType: string; photos: string[] }
+type Held = {
   id: string
-  room_type: string
-  price_per_night: number
+  reference: string
+  dueNow: number
+  holdExpiresAt: string | null
 }
 
-interface Hotel {
-  id: string
-  name: string
-  location: string
+function useCountdown(until: string | null) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!until) return
+    const t = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [until])
+  if (!until) return null
+  const ms = new Date(until).getTime() - now
+  if (ms <= 0) return '0:00'
+  const m = Math.floor(ms / 60000)
+  const s = Math.floor((ms % 60000) / 1000)
+  return `${m}:${String(s).padStart(2, '0')}`
 }
 
-function CheckoutPageContent() {
-  const searchParams = useSearchParams()
-  const router = useRouter()
+function CheckoutContent() {
+  const sp = useSearchParams()
+  const { user, loading: authLoading } = useAuth()
 
-  const hotelId = searchParams.get('hotelId')
-  const roomId = searchParams.get('roomId')
+  const tableOnly = sp.get('type') === 'table'
+  const roomId = sp.get('roomId') || ''
+  const checkIn = sp.get('checkIn') || ''
+  const checkOut = sp.get('checkOut') || ''
+  const guests = Math.max(1, Number(sp.get('guests')) || 1)
+  const addOns = useMemo(() => (sp.get('addOns') || '').split(',').filter(Boolean), [sp])
+  const tableDate = tableOnly ? sp.get('date') || '' : sp.get('tableDate') || ''
+  const tableTime = tableOnly ? sp.get('time') || '' : sp.get('tableTime') || ''
+  const tableGuests = tableOnly ? guests : Math.max(1, Number(sp.get('tableGuests')) || guests)
+  const withTable = Boolean(tableDate && tableTime)
 
-  const [step, setStep] = useState(1)
-  const [hotel, setHotel] = useState<Hotel | null>(null)
-  const [room, setRoom] = useState<Room | null>(null)
+  const [room, setRoom] = useState<RoomInfo | null>(null)
+  const [quote, setQuote] = useState<Quote | null>(null)
+  const [policy, setPolicy] = useState<string[]>([])
+  const [nights, setNights] = useState(0)
+  const [tableNote, setTableNote] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
-  const [bookingId, setBookingId] = useState<string | null>(null)
+  const [loadError, setLoadError] = useState('')
 
-  // Form data
-  const [dates, setDates] = useState({
-    checkIn: '',
-    checkOut: '',
-  })
-  const [guests, setGuests] = useState({
-    count: 1,
-    name: '',
-    email: '',
-    phone: '',
-  })
-  const [specialRequests, setSpecialRequests] = useState('')
-
-  // Calculate stay duration
-  const calculateNights = () => {
-    if (!dates.checkIn || !dates.checkOut) return 0
-    const checkIn = new Date(dates.checkIn)
-    const checkOut = new Date(dates.checkOut)
-    const nights = Math.ceil((checkOut.getTime() - checkIn.getTime()) / (1000 * 60 * 60 * 24))
-    return nights > 0 ? nights : 0
-  }
-
-  const nights = calculateNights()
-  const totalPrice = room ? room.price_per_night * nights : 0
+  const [form, setForm] = useState({ guestName: '', guestEmail: '', guestPhone: '', specialRequest: '' })
+  const [errors, setErrors] = useState<Partial<Record<keyof typeof form, string>>>({})
+  const [submitting, setSubmitting] = useState(false)
+  const [held, setHeld] = useState<Held | null>(null)
+  const countdown = useCountdown(held?.holdExpiresAt ?? null)
 
   useEffect(() => {
-    const fetchData = async () => {
+    if (!user) return
+    setForm((f) => ({ ...f, guestName: f.guestName || user.name || '', guestEmail: f.guestEmail || user.email || '' }))
+  }, [user])
+
+  useEffect(() => {
+    ;(async () => {
       try {
-        if (!hotelId || !roomId) {
-          router.push('/hotels')
+        if (tableOnly) {
+          if (!tableDate || !tableTime) throw new Error('Pick a date and time for your table first.')
+          const res = await fetch('/api/quote', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kind: 'TABLE', guestCount: guests }),
+          })
+          const data = await res.json()
+          if (!res.ok) throw new Error(data.error || 'Could not price this reservation')
+          setQuote(data.quote)
+          setPolicy(data.policy ?? [])
           return
         }
 
-        const response = await fetch(`/api/hotels/${hotelId}`)
-        if (!response.ok) throw new Error('Failed to fetch hotel')
-
-        const data = await response.json()
-        setHotel(data.hotel)
-
-        const foundRoom = data.rooms.find((r: Room) => r.id === roomId)
-        if (foundRoom) {
-          setRoom(foundRoom)
+        if (!roomId || !checkIn || !checkOut) throw new Error('Pick a room and dates first.')
+        const [roomRes, quoteRes] = await Promise.all([
+          fetch(`/api/rooms/${roomId}`),
+          fetch('/api/quote', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              kind: 'ROOM',
+              roomId,
+              checkInDate: checkIn,
+              checkOutDate: checkOut,
+              guestCount: guests,
+              addOns,
+              table: withTable ? { date: tableDate, time: tableTime, guestCount: tableGuests } : null,
+            }),
+          }),
+        ])
+        const roomData = await roomRes.json()
+        const q = await quoteRes.json()
+        if (!roomRes.ok) throw new Error(roomData.error || 'Room not found')
+        if (!quoteRes.ok) throw new Error(q.error || 'Could not price this stay')
+        if (!q.available) throw new Error(q.unavailableReason || 'This room is no longer available for these dates.')
+        setRoom(roomData.room)
+        setQuote(q.quote)
+        setPolicy(q.policy ?? [])
+        setNights(q.nights)
+        if (withTable && q.table && !q.table.available) {
+          setTableNote('No table is free at that time, so your room will be booked on its own.')
         }
-      } catch (error) {
-        console.error('[v0] Error fetching data:', error)
-        router.push('/hotels')
+      } catch (e) {
+        setLoadError(e instanceof Error ? e.message : 'Could not load checkout')
       } finally {
         setLoading(false)
       }
+    })()
+  }, [tableOnly, roomId, checkIn, checkOut, guests, addOns, withTable, tableDate, tableTime, tableGuests])
+
+  const set = (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+    setForm((f) => ({ ...f, [k]: e.target.value }))
+    setErrors((er) => ({ ...er, [k]: undefined }))
+  }
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    const parsed = guestForm.safeParse(form)
+    if (!parsed.success) {
+      const next: typeof errors = {}
+      for (const issue of parsed.error.issues) next[issue.path[0] as keyof typeof form] ??= issue.message
+      setErrors(next)
+      toast.error(parsed.error.issues[0]?.message ?? 'Please check your details')
+      return
     }
 
-    fetchData()
-  }, [hotelId, roomId, router])
-
-  const handleConfirmBooking = async () => {
-    if (!hotelId || !roomId) return
-
+    setSubmitting(true)
     try {
-      const response = await fetch('/api/bookings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          roomId,
-          hotelId,
-          checkInDate: dates.checkIn,
-          checkOutDate: dates.checkOut,
-          guestCount: guests.count,
-          guestName: guests.name,
-          guestEmail: guests.email,
-          guestPhone: guests.phone,
-          specialRequests: specialRequests || null,
-          totalPrice,
-        }),
+      const guest = {
+        guestName: parsed.data.guestName,
+        guestEmail: parsed.data.guestEmail,
+        guestPhone: parsed.data.guestPhone || null,
+        specialRequest: parsed.data.specialRequest || null,
+      }
+      const res = tableOnly
+        ? await fetch('/api/bookings/tables', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ date: tableDate, time: tableTime, guestCount: guests, ...guest }),
+          })
+        : await fetch('/api/bookings/rooms', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              roomId,
+              checkInDate: checkIn,
+              checkOutDate: checkOut,
+              guestCount: guests,
+              addOns,
+              table: withTable ? { date: tableDate, time: tableTime, guestCount: tableGuests } : null,
+              ...guest,
+            }),
+          })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || 'Could not reserve this booking')
+
+      if (data.tableSkipped) {
+        toast.warning(data.tableSkipped, { autoClose: 8000 })
+        setTableNote(data.tableSkipped)
+      }
+      // The server quote at hold time is authoritative.
+      if (data.quote) setQuote(data.quote)
+      setHeld({
+        id: data.booking.id,
+        reference: data.booking.reference,
+        dueNow: data.booking.advanceAmount,
+        holdExpiresAt: data.booking.holdExpiresAt,
       })
-
-      const data = await response.json()
-
-      // Surface what the server actually said — a staff account gets told to
-      // use the dashboard, an unavailable room says so, and so on.
-      if (!response.ok) throw new Error(data.error || 'Failed to create booking')
-
-      setBookingId(data.bookingId)
-      setStep(4)
-    } catch (error) {
-      console.error('[v0] Error confirming booking:', error)
-      alert(error instanceof Error ? error.message : 'Failed to confirm booking. Please try again.')
+      toast.success(`Held for ${data.holdMinutes} minutes — complete payment to confirm.`)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Could not reserve this booking')
+    } finally {
+      setSubmitting(false)
     }
   }
 
-  if (loading) {
+  if (loading || authLoading) {
     return (
-      <div className="min-h-screen bg-background py-12">
-        <div className="max-w-4xl mx-auto px-4">
-          <div className="space-y-4">
-            <div className="h-12 bg-muted rounded animate-pulse" />
-            <div className="h-96 bg-muted rounded animate-pulse" />
-          </div>
-        </div>
+      <div className="mx-auto grid max-w-6xl gap-6 px-4 py-10 sm:px-6 lg:grid-cols-[1fr_400px]">
+        <Skeleton className="h-96 rounded-xl" />
+        <Skeleton className="h-96 rounded-xl" />
       </div>
     )
   }
 
-  if (!hotel || !room) {
+  if (loadError || !quote) {
     return (
-      <div className="min-h-screen bg-background flex items-center justify-center">
-        <div className="text-center">
-          <h1 className="text-2xl font-bold text-foreground mb-4">Booking details not found</h1>
-          <Link href="/hotels">
-            <Button className="bg-primary text-primary-foreground">Back to Hotels</Button>
-          </Link>
-        </div>
+      <div className="mx-auto max-w-xl px-4 py-20 text-center">
+        <AlertCircle className="mx-auto h-8 w-8 text-destructive" aria-hidden />
+        <h1 className="mt-3 text-xl font-semibold">{loadError || 'Checkout unavailable'}</h1>
+        <Button className="mt-6" asChild>
+          <Link href={tableOnly ? '/tables/reserve' : roomId ? `/rooms/${roomId}` : '/rooms'}>Go back</Link>
+        </Button>
       </div>
     )
   }
+
+  const expired = countdown === '0:00'
+  const tableShown = tableOnly || (withTable && quote.tableAmount > 0)
 
   return (
-    <div className="min-h-screen bg-background py-12">
-      <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8">
-        {/* Progress Steps */}
-        <div className="mb-12">
-          <div className="flex items-center justify-between">
-            {[1, 2, 3, 4, 5].map((s) => (
-              <div key={s} className="flex items-center">
-                <div
-                  className={`w-10 h-10 rounded-full flex items-center justify-center font-bold ${
-                    step >= s
-                      ? 'bg-primary text-primary-foreground'
-                      : 'bg-muted text-foreground/50'
-                  }`}
-                >
-                  {step > s ? '✓' : s}
+    <div className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
+      <Link
+        href={tableOnly ? `/tables/reserve?${new URLSearchParams({ date: tableDate, time: tableTime, guests: String(guests) })}` : `/rooms/${roomId}?${new URLSearchParams({ checkIn, checkOut, guests: String(guests) })}`}
+        className="mb-5 inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-primary"
+      >
+        <ArrowLeft className="h-4 w-4" aria-hidden />
+        Back
+      </Link>
+      <h1 className="text-3xl font-bold tracking-tight">Checkout</h1>
+      <p className="mt-1 text-muted-foreground">Review your booking and pay securely to confirm it instantly.</p>
+
+      <div className="mt-6 grid gap-6 lg:grid-cols-[1fr_400px]">
+        {/* ---------------- guest details ---------------- */}
+        <Card className="p-6">
+          <form onSubmit={submit} noValidate className="space-y-4">
+            <h2 className="text-lg font-semibold">Guest details</h2>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="sm:col-span-2">
+                <Label htmlFor="guestName" className="mb-1 block text-sm">Full name</Label>
+                <Input id="guestName" value={form.guestName} onChange={set('guestName')} disabled={!!held}
+                  aria-invalid={!!errors.guestName} autoComplete="name" />
+                {errors.guestName && <p className="mt-1 text-xs text-destructive">{errors.guestName}</p>}
+              </div>
+              <div>
+                <Label htmlFor="guestEmail" className="mb-1 block text-sm">Email</Label>
+                <Input id="guestEmail" type="email" value={form.guestEmail} onChange={set('guestEmail')} disabled={!!held}
+                  aria-invalid={!!errors.guestEmail} autoComplete="email" />
+                {errors.guestEmail && <p className="mt-1 text-xs text-destructive">{errors.guestEmail}</p>}
+              </div>
+              <div>
+                <Label htmlFor="guestPhone" className="mb-1 block text-sm">Phone (for WhatsApp updates)</Label>
+                <Input id="guestPhone" type="tel" value={form.guestPhone} onChange={set('guestPhone')} disabled={!!held}
+                  placeholder="+91 98765 43210" aria-invalid={!!errors.guestPhone} autoComplete="tel" />
+                {errors.guestPhone && <p className="mt-1 text-xs text-destructive">{errors.guestPhone}</p>}
+              </div>
+              <div className="sm:col-span-2">
+                <Label htmlFor="specialRequest" className="mb-1 block text-sm">Special requests</Label>
+                <Textarea id="specialRequest" rows={3} value={form.specialRequest} onChange={set('specialRequest')} disabled={!!held}
+                  placeholder={tableOnly ? 'Birthday, high chair, window seat…' : 'Late arrival, high floor, extra pillows…'} />
+                {errors.specialRequest && <p className="mt-1 text-xs text-destructive">{errors.specialRequest}</p>}
+              </div>
+            </div>
+
+            {tableNote && (
+              <p className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+                <UtensilsCrossed className="mt-0.5 h-4 w-4 flex-shrink-0" aria-hidden />
+                {tableNote}
+              </p>
+            )}
+
+            {!held ? (
+              <Button type="submit" size="lg" className="w-full" disabled={submitting}>
+                {submitting ? (
+                  <><Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden />Reserving…</>
+                ) : (
+                  <><Lock className="mr-2 h-4 w-4" aria-hidden />Continue to payment · {formatINR(quote.dueNow)}</>
+                )}
+              </Button>
+            ) : (
+              <div className="space-y-3 rounded-lg border border-primary/30 bg-primary/5 p-4">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                  <span>
+                    Booking <span className="font-mono font-semibold">{held.reference}</span> is held for you
+                  </span>
+                  {countdown && (
+                    <span className={`flex items-center gap-1 font-medium tabular-nums ${expired ? 'text-destructive' : 'text-primary'}`}>
+                      <Clock className="h-4 w-4" aria-hidden />
+                      {expired ? 'Hold expired' : `${countdown} left`}
+                    </span>
+                  )}
                 </div>
-                {s < 5 && (
-                  <div
-                    className={`flex-1 h-1 mx-2 ${
-                      step > s ? 'bg-primary' : 'bg-muted'
-                    }`}
-                  />
+                <PayButton bookingId={held.id} amount={held.dueNow} className="w-full" />
+                {expired && (
+                  <p className="text-xs text-muted-foreground">
+                    Your hold has lapsed. You can still try to pay — if the room is still free your booking will be confirmed.
+                  </p>
                 )}
               </div>
-            ))}
-          </div>
-          <div className="flex justify-between text-sm text-foreground/70 mt-4">
-            <span>Dates</span>
-            <span>Guest Info</span>
-            <span>Review</span>
-            <span>Payment</span>
-            <span>Confirmation</span>
-          </div>
-        </div>
+            )}
+            <p className="flex items-center justify-center gap-1.5 text-xs text-muted-foreground">
+              <Lock className="h-3 w-3" aria-hidden />
+              Payments are processed securely. Your booking is confirmed automatically once payment succeeds.
+            </p>
+          </form>
+        </Card>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          {/* Main Form */}
-          <div className="lg:col-span-2">
-            {/* Step 1: Dates */}
-            {step === 1 && (
-              <Card className="p-8">
-                <h2 className="text-2xl font-bold text-foreground mb-6">Select Your Dates</h2>
-                <div className="space-y-6">
-                  <div>
-                    <label className="block text-sm font-medium text-foreground mb-2">
-                      Check-in Date
-                    </label>
-                    <Input
-                      type="date"
-                      value={dates.checkIn}
-                      onChange={(e) => setDates({ ...dates, checkIn: e.target.value })}
-                      className="text-lg h-12"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-foreground mb-2">
-                      Check-out Date
-                    </label>
-                    <Input
-                      type="date"
-                      value={dates.checkOut}
-                      onChange={(e) => setDates({ ...dates, checkOut: e.target.value })}
-                      className="text-lg h-12"
-                    />
-                  </div>
-
-                  {dates.checkIn && dates.checkOut && (
-                    <div className="bg-primary/10 p-4 rounded-lg">
-                      <p className="text-sm text-foreground/70">Total nights</p>
-                      <p className="text-2xl font-bold text-primary">{nights} nights</p>
-                    </div>
-                  )}
-
-                  <Button
-                    onClick={() => setStep(2)}
-                    disabled={!dates.checkIn || !dates.checkOut || nights === 0}
-                    className="w-full bg-primary text-primary-foreground hover:bg-primary/90 h-12"
-                  >
-                    Continue <ArrowRight size={20} className="ml-2" />
-                  </Button>
+        {/* ---------------- summary / invoice ---------------- */}
+        <div className="space-y-4 lg:sticky lg:top-6 lg:self-start">
+          <Card className="overflow-hidden">
+            {room && (
+              <div className="flex gap-3 border-b border-border p-4">
+                {room.photos?.[0] && (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={room.photos[0]} alt="" className="h-16 w-20 flex-shrink-0 rounded-md object-cover" />
+                )}
+                <div className="min-w-0">
+                  {room.type && <p className="text-[11px] font-semibold uppercase tracking-widest text-primary">{room.type}</p>}
+                  <p className="truncate font-semibold">{room.name}</p>
+                  <p className="text-xs text-muted-foreground">{room.acType === 'AC' ? 'Air conditioned' : 'Non-AC'}</p>
                 </div>
-              </Card>
+              </div>
             )}
 
-            {/* Step 2: Guest Info */}
-            {step === 2 && (
-              <Card className="p-8">
-                <h2 className="text-2xl font-bold text-foreground mb-6">Guest Information</h2>
-                <div className="space-y-6">
-                  <div>
-                    <label className="block text-sm font-medium text-foreground mb-2">
-                      Full Name
-                    </label>
-                    <Input
-                      value={guests.name}
-                      onChange={(e) => setGuests({ ...guests, name: e.target.value })}
-                      className="text-lg h-12"
-                      placeholder="John Doe"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-foreground mb-2">
-                      Email Address
-                    </label>
-                    <Input
-                      type="email"
-                      value={guests.email}
-                      onChange={(e) => setGuests({ ...guests, email: e.target.value })}
-                      className="text-lg h-12"
-                      placeholder="john@example.com"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-foreground mb-2">
-                      Phone Number
-                    </label>
-                    <Input
-                      value={guests.phone}
-                      onChange={(e) => setGuests({ ...guests, phone: e.target.value })}
-                      className="text-lg h-12"
-                      placeholder="+1 (555) 123-4567"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-foreground mb-2">
-                      Number of Guests
-                    </label>
-                    <Input
-                      type="number"
-                      min="1"
-                      value={guests.count}
-                      onChange={(e) => setGuests({ ...guests, count: parseInt(e.target.value) })}
-                      className="text-lg h-12"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-foreground mb-2">
-                      Special Requests (Optional)
-                    </label>
-                    <textarea
-                      value={specialRequests}
-                      onChange={(e) => setSpecialRequests(e.target.value)}
-                      className="w-full p-3 border border-border rounded-lg text-foreground bg-card"
-                      rows={4}
-                      placeholder="Any special requests for your stay..."
-                    />
-                  </div>
-
-                  <div className="flex gap-4">
-                    <Button
-                      variant="outline"
-                      onClick={() => setStep(1)}
-                      className="flex-1 h-12"
-                    >
-                      Back
-                    </Button>
-                    <Button
-                      onClick={() => setStep(3)}
-                      disabled={!guests.name || !guests.email || !guests.phone}
-                      className="flex-1 bg-primary text-primary-foreground hover:bg-primary/90 h-12"
-                    >
-                      Continue <ArrowRight size={20} className="ml-2" />
-                    </Button>
-                  </div>
-                </div>
-              </Card>
-            )}
-
-            {/* Step 3: Review */}
-            {step === 3 && (
-              <Card className="p-8">
-                <h2 className="text-2xl font-bold text-foreground mb-6">Review Your Booking</h2>
-                <div className="space-y-6">
-                  <div className="border-b border-border pb-4">
-                    <h3 className="font-semibold text-foreground mb-2">{room.room_type}</h3>
-                    <p className="text-foreground/70 mb-2">{hotel.name}</p>
-                    <p className="text-foreground/70">{hotel.location}</p>
-                  </div>
-
-                  <div className="border-b border-border pb-4">
-                    <p className="text-sm text-foreground/70 mb-1">Dates</p>
-                    <p className="font-semibold text-foreground">
-                      {dates.checkIn} to {dates.checkOut}
-                    </p>
-                    <p className="text-foreground/70">{nights} nights</p>
-                  </div>
-
-                  <div className="border-b border-border pb-4">
-                    <p className="text-sm text-foreground/70 mb-1">Guest</p>
-                    <p className="font-semibold text-foreground">{guests.name}</p>
-                    <p className="text-foreground/70">{guests.email}</p>
-                    <p className="text-foreground/70">{guests.phone}</p>
-                  </div>
-
-                  {specialRequests && (
-                    <div className="border-b border-border pb-4">
-                      <p className="text-sm text-foreground/70 mb-1">Special Requests</p>
-                      <p className="text-foreground">{specialRequests}</p>
-                    </div>
-                  )}
-
-                  <div className="flex gap-4">
-                    <Button
-                      variant="outline"
-                      onClick={() => setStep(2)}
-                      className="flex-1 h-12"
-                    >
-                      Back
-                    </Button>
-                    <Button
-                      onClick={() => setStep(4)}
-                      className="flex-1 bg-primary text-primary-foreground hover:bg-primary/90 h-12"
-                    >
-                      Continue to Payment <ArrowRight size={20} className="ml-2" />
-                    </Button>
-                  </div>
-                </div>
-              </Card>
-            )}
-
-            {/* Step 4: Payment */}
-            {step === 4 && (
-              <>
-                <StripePayment
-                  bookingId={bookingId || ''}
-                  hotelName={hotel?.name || ''}
-                  roomType={room?.room_type || ''}
-                  totalPrice={totalPrice}
-                  nights={nights}
-                  guestName={guests.name}
-                  guestEmail={guests.email}
-                  onSuccess={() => setStep(5)}
-                />
-              </>
-            )}
-
-            {/* Step 5: Confirmation */}
-            {step === 5 && (
-              <Card className="p-8 text-center">
-                <div className="mb-6">
-                  <CheckCircle size={64} className="text-primary mx-auto" />
-                </div>
-                <h2 className="text-3xl font-bold text-foreground mb-4">
-                  Booking Confirmed!
-                </h2>
-                <p className="text-foreground/70 mb-8">
-                  Your booking has been confirmed and paid. A confirmation email has been sent to {guests.email}.
+            <div className="space-y-2 border-b border-border p-4 text-sm">
+              {!tableOnly && (
+                <>
+                  <p className="flex items-center gap-2">
+                    <CalendarDays className="h-4 w-4 text-muted-foreground" aria-hidden />
+                    {formatDate(checkIn)} → {formatDate(checkOut)} · {nights} night{nights === 1 ? '' : 's'}
+                  </p>
+                  <p className="flex items-center gap-2">
+                    <BedDouble className="h-4 w-4 text-muted-foreground" aria-hidden />
+                    Check-in from {HOTEL.policies.checkIn}, check-out by {HOTEL.policies.checkOut}
+                  </p>
+                  <p className="flex items-center gap-2">
+                    <Users className="h-4 w-4 text-muted-foreground" aria-hidden />
+                    {guests} guest{guests === 1 ? '' : 's'}
+                  </p>
+                </>
+              )}
+              {tableShown && (
+                <p className="flex items-center gap-2">
+                  <UtensilsCrossed className="h-4 w-4 text-muted-foreground" aria-hidden />
+                  {HOTEL.dining.name} · {formatDate(tableDate)}, {slotLabel(tableTime)} · {tableGuests} diner{tableGuests === 1 ? '' : 's'}
                 </p>
-                <div className="space-y-4">
-                  <Link href="/bookings">
-                    <Button className="w-full bg-primary text-primary-foreground hover:bg-primary/90 h-12">
-                      View My Bookings
-                    </Button>
-                  </Link>
-                  <Link href="/hotels">
-                    <Button variant="outline" className="w-full h-12">
-                      Continue Browsing
-                    </Button>
-                  </Link>
-                </div>
-              </Card>
-            )}
-          </div>
+              )}
+            </div>
 
-          {/* Booking Summary Sidebar */}
-          <div>
-            <Card className="p-6 sticky top-20">
-              <h3 className="text-lg font-bold text-foreground mb-4">Booking Summary</h3>
+            <div className="p-4">
+              <p className="mb-2 text-sm font-semibold">{tableShown && !tableOnly ? 'Combined invoice' : 'Price breakdown'}</p>
+              <PriceSummary
+                quote={quote}
+                showNights={!tableOnly}
+                tableLabel={tableShown ? `Table for ${tableGuests}` : null}
+              />
+            </div>
+          </Card>
 
-              <div className="space-y-3 pb-4 border-b border-border mb-4">
-                <div className="flex justify-between">
-                  <span className="text-foreground/70">Room:</span>
-                  <span className="font-semibold text-foreground">{room.room_type}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-foreground/70">Nights:</span>
-                  <span className="font-semibold text-foreground">{nights}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-foreground/70">Price per night:</span>
-                  <span className="font-semibold text-foreground">${room.price_per_night}</span>
-                </div>
-              </div>
-
-              <div className="flex justify-between items-center mb-6">
-                <span className="font-semibold text-foreground">Total Price:</span>
-                <span className="text-2xl font-bold text-primary">${totalPrice}</span>
-              </div>
-
-              <div className="space-y-2 text-sm text-foreground/70">
-                <p>✓ Free cancellation</p>
-                <p>✓ No hidden fees</p>
-                <p>✓ Secure payment</p>
-              </div>
+          {policy.length > 0 && (
+            <Card className="p-4">
+              <p className="mb-2 text-sm font-semibold">Cancellation policy</p>
+              <PolicyList lines={policy} />
             </Card>
-          </div>
+          )}
         </div>
       </div>
     </div>
   )
 }
 
-/**
- * useSearchParams() forces client-side bailout, which Next requires to sit
- * behind a Suspense boundary or the page fails to prerender at build time.
- */
 export default function CheckoutPage() {
   return (
     <Suspense
       fallback={
-        <div className="flex min-h-[50vh] items-center justify-center text-muted-foreground">
-          Loading…
+        <div className="flex min-h-[60vh] items-center justify-center text-muted-foreground">
+          <Loader2 className="mr-2 h-5 w-5 animate-spin" />Loading checkout…
         </div>
       }
     >
-      <CheckoutPageContent />
+      <CheckoutContent />
     </Suspense>
   )
 }
