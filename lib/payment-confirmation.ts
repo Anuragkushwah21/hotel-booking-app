@@ -35,7 +35,7 @@ import {
 } from './booking-engine'
 import { createGatewayOrder, type GatewayOrder } from './payment-gateway'
 import { getHotelSettings } from './settings'
-import { taxOn } from './pricing'
+import { tableGstPercent, taxOn } from './pricing'
 import { queueBookingNotifications } from './notifications'
 
 type Tx = Prisma.TransactionClient
@@ -228,7 +228,7 @@ export async function confirmOnlinePayment(input: {
       let refundExcess = 0
       if (booking.type === 'ROOM_TABLE' && !tableFree) {
         const settings = await getHotelSettings(tx)
-        const tableTax = taxOn(booking.tableAmount, settings.gstPercent)
+        const tableTax = taxOn(booking.tableAmount, tableGstPercent(settings))
         total = booking.totalPrice - booking.tableAmount - tableTax
         refundExcess = Math.max(0, paid - total)
         tableDrop = {

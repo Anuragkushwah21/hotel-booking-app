@@ -9,10 +9,8 @@ export async function GET(
     // ✅ Await params first
     const { roomId } = await params
 
-    console.log('🔍 API: Room ID:', roomId)
 
     if (!roomId || roomId === 'undefined') {
-      console.log('❌ Invalid room ID')
       return NextResponse.json(
         { error: 'Room ID is required' },
         { status: 400 }
@@ -38,7 +36,6 @@ export async function GET(
       },
     })
 
-    console.log('📥 API: Room found:', room)
 
     if (!room) {
       return NextResponse.json(

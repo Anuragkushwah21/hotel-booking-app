@@ -47,6 +47,7 @@ export async function POST(req: NextRequest) {
       specialRequest: body.specialRequest,
       addOns: body.addOns,
       table: body.table ? { ...body.table, required: false } : null,
+      transfer: body.transfer,
       source: 'ONLINE',
       bookedById: null,
     })

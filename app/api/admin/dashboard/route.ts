@@ -101,10 +101,10 @@ export async function GET(_req: NextRequest) {
         _sum: { remainingAmount: true },
         _count: { _all: true },
       }),
-      prisma.payment.groupBy({
-        by: ['kind'],
+      // Row-level (not groupBy) so today's money can be split by channel.
+      prisma.payment.findMany({
         where: { status: 'SUCCEEDED', paidAt: { gte: todayStart, lt: todayEnd } },
-        _sum: { amount: true },
+        select: { kind: true, amount: true, booking: { select: { source: true } } },
       }),
       prisma.payment.groupBy({
         by: ['kind'],
@@ -161,6 +161,12 @@ export async function GET(_req: NextRequest) {
     const net = (rows: { kind: string; _sum: { amount: number | null } }[]) =>
       rows.reduce((s, r) => s + (r.kind === 'REFUND' ? -1 : 1) * (r._sum.amount ?? 0), 0)
 
+    // Refunds count against the day they were paid out.
+    const netToday = (source?: 'ONLINE' | 'WALK_IN') =>
+      todayPayments
+        .filter((p) => !source || p.booking.source === source)
+        .reduce((s, p) => s + (p.kind === 'REFUND' ? -1 : 1) * p.amount, 0)
+
     const sellable = totalRooms - maintenanceRooms
     const blockedOnly = blockedToday.filter((b) => !occupiedToday.some((o) => o.roomId === b.roomId)).length
     const occupied = occupiedToday.length
@@ -183,7 +189,9 @@ export async function GET(_req: NextRequest) {
         tableReservationsToday: tablesToday,
         pendingPaymentCount: pending._count._all,
         pendingPaymentAmount: pending._sum.remainingAmount ?? 0,
-        revenueToday: net(todayPayments),
+        revenueToday: netToday(),
+        onlineRevenueToday: netToday('ONLINE'),
+        walkInRevenueToday: netToday('WALK_IN'),
         totalRevenue: net(allPayments),
         refundsPending: refundAlerts.length,
       },

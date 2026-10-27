@@ -6,6 +6,7 @@ import { useRouter, usePathname } from 'next/navigation'
 import {
   PanelLeftClose, PanelLeft, LogOut, LayoutDashboard, BedDouble,
   CalendarCheck, BarChart3, UtensilsCrossed, PlusCircle, ChevronRight, ExternalLink,
+  Wallet, Tags, Users, Settings,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -17,6 +18,8 @@ type NavItem = {
   icon: React.ElementType
   /** Match the pathname exactly — needed so /admin isn't active everywhere. */
   exact?: boolean
+  /** Hidden from HOTEL_MANAGER; the page itself also enforces it. */
+  adminOnly?: boolean
 }
 
 const NAV: { section: string; items: NavItem[] }[] = [
@@ -29,6 +32,7 @@ const NAV: { section: string; items: NavItem[] }[] = [
     items: [
       { label: 'New booking', href: '/admin/bookings/new', icon: PlusCircle },
       { label: 'Bookings', href: '/admin/bookings', icon: CalendarCheck },
+      { label: 'Payments & refunds', href: '/admin/payments', icon: Wallet, adminOnly: true },
     ],
   },
   {
@@ -36,13 +40,27 @@ const NAV: { section: string; items: NavItem[] }[] = [
     items: [
       { label: 'Rooms', href: '/admin/rooms', icon: BedDouble },
       { label: 'Tables', href: '/admin/tables', icon: UtensilsCrossed },
+      { label: 'Rates & seasons', href: '/admin/pricing', icon: Tags, adminOnly: true },
     ],
   },
   {
     section: 'Insights',
-    items: [{ label: 'Reports', href: '/admin/analytics', icon: BarChart3 }],
+    items: [{ label: 'Reports', href: '/admin/analytics', icon: BarChart3, adminOnly: true }],
+  },
+  {
+    section: 'Administration',
+    items: [
+      { label: 'Users & staff', href: '/admin/users', icon: Users, adminOnly: true },
+      { label: 'Settings', href: '/admin/settings', icon: Settings, adminOnly: true },
+    ],
   },
 ]
+
+function navFor(role: Staff['role']) {
+  return NAV.map((g) => ({ ...g, items: g.items.filter((i) => !i.adminOnly || role === 'ADMIN') })).filter(
+    (g) => g.items.length > 0,
+  )
+}
 
 /** Flat list used to resolve the current page's title for the top bar. */
 const FLAT = NAV.flatMap((g) => g.items)
@@ -61,6 +79,7 @@ export function AdminShell({ user, children }: { user: Staff; children: React.Re
   const router = useRouter()
   const pathname = usePathname()
   const [collapsed, setCollapsed] = useState(false)
+  const nav = navFor(user.role)
 
   // Remember the sidebar state so it doesn't reset on every navigation.
   useEffect(() => {
@@ -110,7 +129,7 @@ export function AdminShell({ user, children }: { user: Staff; children: React.Re
         </div>
 
         <nav className="flex-1 space-y-5 overflow-y-auto px-3 py-4">
-          {NAV.map((group) => (
+          {nav.map((group) => (
             <div key={group.section}>
               {!collapsed && (
                 <p className="mb-1.5 px-2.5 text-[10px] font-semibold uppercase tracking-widest text-zinc-600">
@@ -217,7 +236,7 @@ export function AdminShell({ user, children }: { user: Staff; children: React.Re
 
         {/* Mobile nav — the sidebar is hidden below md */}
         <div className="flex gap-1 overflow-x-auto border-b border-border/70 bg-card px-3 py-2 md:hidden">
-          {FLAT.map((item) => {
+          {nav.flatMap((g) => g.items).map((item) => {
             const Icon = item.icon
             return (
               <Link

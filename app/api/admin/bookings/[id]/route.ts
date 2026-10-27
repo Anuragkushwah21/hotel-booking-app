@@ -95,7 +95,7 @@ export async function PATCH(
     const existing = await prisma.booking.findUnique({ where: { id }, include: { room: true } })
     if (!existing) return NextResponse.json({ error: 'Booking not found' }, { status: 404 })
 
-    if (existing.status === 'CANCELLED' || existing.status === 'CHECKED_OUT') {
+    if (existing.status === 'CANCELLED' || existing.status === 'CHECKED_OUT' || existing.status === 'NO_SHOW') {
       return NextResponse.json(
         { error: `A ${existing.status.toLowerCase().replace('_', ' ')} booking cannot be modified` },
         { status: 409 },
@@ -195,6 +195,7 @@ export async function PATCH(
       data.baseAmount = quote.roomAmount + quote.tableAmount
       data.addOnsAmount = addOnsAmount
       data.taxAmount = quote.taxAmount
+      data.taxBreakdown = quote.taxBreakdown
       data.totalPrice = quote.total
 
       // Re-read paid amount: a payment status change above may have moved it.
@@ -216,9 +217,30 @@ export async function PATCH(
       return NextResponse.json({ error: 'Nothing to update' }, { status: 400 })
     }
 
+    // The availability check above is a fast pre-check for a friendly error.
+    // The authoritative one runs again here, holding the same room lock the
+    // booking engine takes, so a concurrent online booking can't slip into the
+    // new dates between the check and the write.
     const updated =
       Object.keys(data).length > 0
-        ? await prisma.booking.update({ where: { id }, data, include: included })
+        ? await prisma.$transaction(
+            async (tx) => {
+              if (data.checkInDate && existing.roomId) {
+                await tx.$queryRaw`SELECT id FROM "Room" WHERE id = ${existing.roomId} FOR UPDATE`
+                const recheck = await checkRoomAvailability(
+                  existing.roomId,
+                  data.checkInDate as Date,
+                  data.checkOutDate as Date,
+                  { excludeBookingId: id, client: tx },
+                )
+                if (!recheck.available) {
+                  throw new BookingError(recheck.reason ?? 'Room unavailable for the new dates', 409, 'UNAVAILABLE')
+                }
+              }
+              return tx.booking.update({ where: { id }, data, include: included })
+            },
+            { timeout: 15000, maxWait: 10000 },
+          )
         : await prisma.booking.findUniqueOrThrow({ where: { id }, include: included })
 
     if (Object.keys(changes).length > 0) {

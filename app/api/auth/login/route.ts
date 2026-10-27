@@ -1,69 +1,51 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { z } from 'zod'
 import { prisma } from '@/lib/prisma'
-import bcrypt from 'bcryptjs'
-import { cookies } from 'next/headers'
-import crypto from 'crypto'
+import { startSession, verifyPassword } from '@/lib/auth'
+import { parseJson } from '@/lib/validation'
+import { rateLimitAll, tooManyRequests } from '@/lib/rate-limit'
+import { clientIp } from '@/lib/security'
+
+const schema = z.object({
+  email: z.string().trim().toLowerCase().email('Enter a valid email'),
+  password: z.string().min(1, 'Password is required').max(200),
+})
+
+// Compared against when the account doesn't exist, so a miss costs the same
+// time as a wrong password and response timing doesn't reveal which emails exist.
+const DUMMY_HASH = '$2b$12$9yH/78bah7W2WzV7ZSH/RORyEYQaCij2BaoatP5PVQgloBH0EjPz2'
 
 export async function POST(req: NextRequest) {
+  const parsed = await parseJson(req, schema)
+  if (!parsed.ok) return parsed.response
+  const { email, password } = parsed.data
+
+  const rl = await rateLimitAll([
+    { key: `login:ip:${clientIp(req)}`, limit: 20, windowSeconds: 15 * 60 },
+    { key: `login:email:${email}`, limit: 8, windowSeconds: 15 * 60 },
+  ])
+  if (!rl.ok) return tooManyRequests(rl, 'Too many login attempts. Please wait a few minutes and try again.')
+
   try {
-    const { email, password } = await req.json()
+    const user = await prisma.user.findUnique({ where: { email } })
+    const isValid = await verifyPassword(password, user?.passwordHash ?? DUMMY_HASH)
 
-    if (!email || !password) {
-      return NextResponse.json(
-        { error: 'Email and password are required' },
-        { status: 400 },
-      )
+    if (!user || !user.passwordHash || !isValid) {
+      return NextResponse.json({ error: 'Invalid credentials' }, { status: 401 })
     }
 
-    const user = await prisma.user.findUnique({
-      where: { email },
-    })
-
-    if (!user || !user.passwordHash) {
-      return NextResponse.json(
-        { error: 'Invalid credentials' },
-        { status: 401 },
-      )
-    }
-
-    const isValid = await bcrypt.compare(password, user.passwordHash)
-    if (!isValid) {
-      return NextResponse.json(
-        { error: 'Invalid credentials' },
-        { status: 401 },
-      )
+    if (user.status !== 'ACTIVE') {
+      return NextResponse.json({ error: 'This account has been deactivated' }, { status: 403 })
     }
 
     if (!user.emailVerified) {
       return NextResponse.json(
-        { error: 'Please verify your email before logging in' },
+        { error: 'Please verify your email before logging in', code: 'EMAIL_NOT_VERIFIED' },
         { status: 403 },
       )
     }
 
-    // Session create
-    const sessionToken = crypto.randomBytes(32).toString('hex')
-    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
-
-    await prisma.session.create({
-      data: {
-        userId: user.id,
-        token: sessionToken,
-        expiresAt,
-      },
-    })
-
-    const cookieStore = await cookies()
-    cookieStore.set('session_token', sessionToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      path: '/',
-      expires: expiresAt,
-    })
-
-    // IMPORTANT: role + isAdmin expose karo
-    return NextResponse.json(
+    const response = NextResponse.json(
       {
         message: 'Logged in successfully',
         user: {
@@ -76,11 +58,12 @@ export async function POST(req: NextRequest) {
       },
       { status: 200 },
     )
+    if (!(await startSession(response, user))) {
+      return NextResponse.json({ error: 'Login failed' }, { status: 500 })
+    }
+    return response
   } catch (error) {
     console.error('[login] error:', error)
-    return NextResponse.json(
-      { error: 'Login failed' },
-      { status: 500 },
-    )
+    return NextResponse.json({ error: 'Login failed' }, { status: 500 })
   }
 }

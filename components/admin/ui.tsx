@@ -10,7 +10,9 @@ import * as React from 'react'
 import { cn } from '@/lib/utils'
 
 /** Whole-rupee formatter. Compact form for tight stat tiles. */
-export function inr(n: number, compact = false): string {
+export function inr(value: number | null | undefined, compact = false): string {
+  // A missing field must render as ₹0, not take the whole page down.
+  const n = Number.isFinite(value) ? (value as number) : 0
   if (compact && Math.abs(n) >= 100000) return `₹${(n / 100000).toFixed(1)}L`
   if (compact && Math.abs(n) >= 1000) return `₹${(n / 1000).toFixed(1)}k`
   return `₹${n.toLocaleString('en-IN')}`

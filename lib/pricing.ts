@@ -27,6 +27,23 @@ export type PricingSettings = Pick<
   | 'longStayMinNights'
   | 'gstPercent'
   | 'tablePricePerGuest'
+  | 'taxMode'
+  | 'roomGstThreshold'
+  | 'roomGstLowPercent'
+  | 'roomGstHighPercent'
+  | 'tableGstPercent'
+  | 'addOnGstPercent'
+>
+
+export type TaxSettings = Pick<
+  PricingSettings,
+  | 'gstPercent'
+  | 'taxMode'
+  | 'roomGstThreshold'
+  | 'roomGstLowPercent'
+  | 'roomGstHighPercent'
+  | 'tableGstPercent'
+  | 'addOnGstPercent'
 >
 
 export type RoomRates = {
@@ -99,6 +116,57 @@ export function taxOn(amount: number, gstPercent: number): number {
   return Math.round((amount * gstPercent) / 100)
 }
 
+// ------------------------------------------------------------------
+// GST
+//
+// FLAT        one rate (gstPercent) on the whole bill — the original behaviour.
+// INDIA_SLABS each room night is taxed by its own tariff (≤ threshold → low
+//             rate, above → high rate); the restaurant table and the add-ons
+//             carry their own configured rates. Rates are admin settings, not
+//             hard-coded law — confirm them with the hotel's CA.
+// ------------------------------------------------------------------
+
+export function roomNightGstPercent(rate: number, s: TaxSettings): number {
+  if (s.taxMode !== 'INDIA_SLABS') return s.gstPercent
+  return rate <= s.roomGstThreshold ? s.roomGstLowPercent : s.roomGstHighPercent
+}
+
+export function tableGstPercent(s: TaxSettings): number {
+  return s.taxMode === 'INDIA_SLABS' ? s.tableGstPercent : s.gstPercent
+}
+
+export function addOnGstPercent(s: TaxSettings): number {
+  return s.taxMode === 'INDIA_SLABS' ? s.addOnGstPercent : s.gstPercent
+}
+
+export type TaxBreakdown = { room: number; table: number; addOns: number }
+
+/** Tax on a stay, split by component. FLAT rounds once over the subtotal, as before. */
+export function taxForStay(
+  nights: { rate: number }[],
+  tableAmount: number,
+  addOnsAmount: number,
+  s: TaxSettings,
+): { total: number; breakdown: TaxBreakdown } {
+  if (s.taxMode !== 'INDIA_SLABS') {
+    const roomAmount = nights.reduce((sum, n) => sum + n.rate, 0)
+    const total = taxOn(roomAmount + tableAmount + addOnsAmount, s.gstPercent)
+    const table = taxOn(tableAmount, s.gstPercent)
+    const addOns = taxOn(addOnsAmount, s.gstPercent)
+    return { total, breakdown: { room: total - table - addOns, table, addOns } }
+  }
+  const room = nights.reduce((sum, n) => sum + taxOn(n.rate, roomNightGstPercent(n.rate, s)), 0)
+  const table = taxOn(tableAmount, s.tableGstPercent)
+  const addOns = taxOn(addOnsAmount, s.addOnGstPercent)
+  return { total: room + table + addOns, breakdown: { room, table, addOns } }
+}
+
+/** "GST (12%)" for a single rate, plain "GST" when slabs mix rates. */
+export function gstLabel(s: TaxSettings): string {
+  if (s.taxMode !== 'INDIA_SLABS') return `GST (${s.gstPercent}%)`
+  return 'GST'
+}
+
 export type TableLine = { guests: number; amount: number }
 
 export function priceTable(guests: number, settings: Pick<PricingSettings, 'tablePricePerGuest'>): TableLine {
@@ -120,7 +188,10 @@ export type Quote = {
   dueLater: number
   rule: PaymentRule
   ruleLabel: string
+  /** The flat rate, or 0 in INDIA_SLABS mode — show `gstLabel` instead. */
   gstPercent: number
+  gstLabel: string
+  taxBreakdown: TaxBreakdown
   hasPremiumNight: boolean
 }
 
@@ -140,12 +211,13 @@ export function quoteStay(input: {
   const roomAmount = nights.reduce((s, n) => s + n.rate, 0)
   const tableAmount = input.table?.amount ?? 0
   const subtotal = roomAmount + input.addOnsAmount + tableAmount
-  const taxAmount = taxOn(subtotal, settings.gstPercent)
+  const tax = taxForStay(nights, tableAmount, input.addOnsAmount, settings)
+  const taxAmount = tax.total
   const total = subtotal + taxAmount
 
-  const tableWithTax = tableAmount + taxOn(tableAmount, settings.gstPercent)
+  const tableWithTax = tableAmount + tax.breakdown.table
   const firstNightWithTax = nights.length
-    ? nights[0].rate + taxOn(nights[0].rate, settings.gstPercent)
+    ? nights[0].rate + taxOn(nights[0].rate, roomNightGstPercent(nights[0].rate, settings))
     : 0
 
   const hasPremiumNight = nights.some((n) => n.kind !== 'NORMAL')
@@ -189,7 +261,9 @@ export function quoteStay(input: {
     dueLater: total - dueNow,
     rule,
     ruleLabel: PAYMENT_RULE_LABELS[rule],
-    gstPercent: settings.gstPercent,
+    gstPercent: settings.taxMode === 'INDIA_SLABS' ? 0 : settings.gstPercent,
+    gstLabel: gstLabel(settings),
+    taxBreakdown: tax.breakdown,
     hasPremiumNight,
   }
 }
@@ -202,7 +276,8 @@ export function quoteTableOnly(
 ): Quote {
   const table = priceTable(guests, settings)
   const subtotal = table.amount + addOnsAmount
-  const taxAmount = taxOn(subtotal, settings.gstPercent)
+  const tax = taxForStay([], table.amount, addOnsAmount, settings)
+  const taxAmount = tax.total
   const total = subtotal + taxAmount
   return {
     nights: [],
@@ -216,7 +291,9 @@ export function quoteTableOnly(
     dueLater: 0,
     rule: 'TABLE_FULL',
     ruleLabel: PAYMENT_RULE_LABELS.TABLE_FULL,
-    gstPercent: settings.gstPercent,
+    gstPercent: settings.taxMode === 'INDIA_SLABS' ? 0 : settings.gstPercent,
+    gstLabel: gstLabel(settings),
+    taxBreakdown: tax.breakdown,
     hasPremiumNight: false,
   }
 }

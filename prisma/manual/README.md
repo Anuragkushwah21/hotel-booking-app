@@ -1,4 +1,9 @@
-# Manual migration steps
+# Manual migration steps (historical)
+
+> **Superseded.** The project now uses `prisma/migrations/` (see AUDIT.md →
+> "Database deploy"). `0_init` contains everything 001–004 produced, including
+> `generate_booking_ref()`. These files are kept only for reference — do not
+> run them against a database that already has the migrations applied.
 
 This project has no `prisma/migrations/` history: the schema is applied with
 `prisma db push`, plus the SQL files in this folder for the steps `db push`
@@ -50,18 +55,3 @@ pnpm prisma:generate
 Run 003 and 004 as separate commands: PostgreSQL won't let a transaction use
 an enum value added in the same transaction.
 
-## Starting a real migration history (optional, recommended)
-
-Once the database matches `schema.prisma`, baseline it so future changes can
-use `prisma migrate`:
-
-```bash
-mkdir -p prisma/migrations/0_init
-pnpm prisma migrate diff --from-empty --to-schema prisma/schema.prisma --script \
-  > prisma/migrations/0_init/migration.sql
-pnpm prisma migrate resolve --applied 0_init
-```
-
-Note: `0_init` will not contain `generate_booking_ref()` from 002 — append the
-function from `002_booking_reference.sql` to that migration file so a fresh
-database built from migrations gets it too.

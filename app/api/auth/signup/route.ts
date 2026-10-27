@@ -1,22 +1,31 @@
 // app/api/auth/signup/route.ts
 import { NextRequest, NextResponse } from 'next/server'
+import { z } from 'zod'
 import { prisma } from '@/lib/prisma'
-import bcrypt from 'bcryptjs'
+import { hashPassword, MIN_PASSWORD_LENGTH } from '@/lib/auth'
 import { createAndSendEmailOtp } from '@/lib/email'
+import { parseJson } from '@/lib/validation'
+import { rateLimit, tooManyRequests } from '@/lib/rate-limit'
+import { clientIp } from '@/lib/security'
+
+const schema = z.object({
+  email: z.string().trim().toLowerCase().email('Enter a valid email'),
+  password: z
+    .string()
+    .min(MIN_PASSWORD_LENGTH, `Password must be at least ${MIN_PASSWORD_LENGTH} characters`)
+    .max(200),
+  name: z.string().trim().max(120).optional().nullable(),
+})
 
 export async function POST(req: NextRequest) {
+  const parsed = await parseJson(req, schema)
+  if (!parsed.ok) return parsed.response
+  const { email, password, name } = parsed.data
+
+  const rl = await rateLimit(`signup:ip:${clientIp(req)}`, 10, 60 * 60)
+  if (!rl.ok) return tooManyRequests(rl)
+
   try {
-    const body = await req.json()
-    const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : ''
-    const { password, name } = body
-
-    if (!email || !password) {
-      return NextResponse.json(
-        { error: 'Email and password are required' },
-        { status: 400 },
-      )
-    }
-
     // A guest who booked without an account already has a passwordless GUEST
     // record. Completing signup should claim that record, not block them from
     // creating an account or detach their booking history.
@@ -31,8 +40,10 @@ export async function POST(req: NextRequest) {
       )
     }
 
-    // 2) Create a normal guest, or add credentials to the passwordless guest.
-    const passwordHash = await bcrypt.hash(password, 10)
+    // Create a normal guest, or add credentials to the passwordless guest.
+    // The record stays unverified until the OTP proves the email is theirs, so
+    // claiming someone else's guest record gets nowhere.
+    const passwordHash = await hashPassword(password)
 
     const user = existingUser
       ? await prisma.user.update({
@@ -42,7 +53,7 @@ export async function POST(req: NextRequest) {
       : await prisma.user.create({
           data: {
             email,
-            name,
+            name: name || null,
             passwordHash,
             role: 'GUEST',
             status: 'ACTIVE',
@@ -51,13 +62,12 @@ export async function POST(req: NextRequest) {
           },
         })
 
-    // 3) generate OTP + save + send (all inside helper)
     const result = await createAndSendEmailOtp(email, name)
 
     if (!result.success) {
       return NextResponse.json(
         {
-          error: 'User created but failed to send verification code',
+          error: 'Account created but we could not send the verification code. Use “Resend code” to try again.',
         },
         { status: 500 },
       )

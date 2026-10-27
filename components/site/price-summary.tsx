@@ -77,7 +77,7 @@ export function PriceSummary({
       {!showNights && quote.roomAmount > 0 && <Row muted label="Room charges" value={formatINR(quote.roomAmount)} />}
       {quote.tableAmount > 0 && <Row muted label={tableLabel ?? 'Table reservation'} value={formatINR(quote.tableAmount)} />}
       {quote.addOnsAmount > 0 && <Row muted label="Add-on services" value={formatINR(quote.addOnsAmount)} />}
-      {quote.taxAmount > 0 && <Row muted label={`GST (${quote.gstPercent}%)`} value={formatINR(quote.taxAmount)} />}
+      {quote.taxAmount > 0 && <Row muted label={quote.gstLabel ?? `GST (${quote.gstPercent}%)`} value={formatINR(quote.taxAmount)} />}
 
       <div className="border-t border-border pt-2">
         <Row strong label="Grand total" value={formatINR(quote.total)} />

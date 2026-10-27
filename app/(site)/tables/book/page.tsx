@@ -96,7 +96,7 @@ export default function TableBookingPage() {
               </span>
             </p>
             <p className="mt-1 text-xs text-muted-foreground">
-              We've emailed the details too. Keep this number to check your
+              We&apos;ve emailed the details too. Keep this number to check your
               booking any time.
             </p>
             <div className="mt-3 flex flex-wrap gap-2">

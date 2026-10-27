@@ -87,9 +87,17 @@ const handleSubmit = async (e: React.FormEvent) => {
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-foreground mb-2">
-              Password
-            </label>
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <label className="block text-sm font-medium text-foreground">
+                Password
+              </label>
+              <Link
+                href={email ? `/forgot-password?email=${encodeURIComponent(email)}` : '/forgot-password'}
+                className="text-sm text-primary hover:text-primary/80"
+              >
+                Forgot password?
+              </Link>
+            </div>
             <Input
               type="password"
               value={password}

@@ -33,7 +33,6 @@ model User {
   bookings         Booking[]       @relation("GuestBookings")
   managedBookings  Booking[]       @relation("ManagerBookings")
   managerActions   ManagerAction[]
-  otpCodes         OTPCode[]
   paymentsRecorded Payment[]       @relation("PaymentsRecorded")
   reviews          Review[]
   sessions         Session[]
@@ -57,31 +56,47 @@ model Session {
   @@index([token])
 }
 
+/// One-time codes. Only an HMAC of the code is stored (see lib/otp.ts), never
+/// the code itself, and every wrong guess counts against `attempts`.
 model OTPCode {
-  id         String    @id @default(cuid())
-  email      String
-  code       String    @unique
-  expiresAt  DateTime
-  verifiedAt DateTime?
-  createdAt  DateTime  @default(now())
-  attempts   Int       @default(0)
+  id          String     @id @default(cuid())
+  purpose     OtpPurpose @default(EMAIL_VERIFY)
+  /// What the code proves control of: the account email for EMAIL_VERIFY, the
+  /// normalised lookup query (reference / email / phone) for BOOKING_LOOKUP.
+  subject     String
+  /// Where the code was sent (email address).
+  destination String
+  codeHash    String
+  expiresAt   DateTime
+  verifiedAt  DateTime?
+  attempts    Int        @default(0)
+  createdAt   DateTime   @default(now())
 
-  user User? @relation(fields: [email], references: [email], onDelete: SetNull)
-
-  @@index([email])
-  @@index([code])
+  @@index([purpose, subject])
   @@index([expiresAt])
 }
 
+/// Single-use password reset / staff invite links. `token` holds a SHA-256 of
+/// the value in the link, so a database leak can't be replayed.
 model PasswordResetToken {
-  id        String   @id @default(cuid())
+  id        String    @id @default(cuid())
   email     String
-  token     String   @unique
+  token     String    @unique
   expiresAt DateTime
-  createdAt DateTime @default(now())
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
 
   @@index([email])
-  @@index([token])
+}
+
+/// Fixed-window counters for lib/rate-limit.ts. Lives in Postgres so the limit
+/// holds across serverless instances.
+model RateLimit {
+  key     String   @id
+  count   Int      @default(0)
+  resetAt DateTime
+
+  @@index([resetAt])
 }
 
 // ============================================
@@ -89,24 +104,25 @@ model PasswordResetToken {
 // ============================================
 
 model Room {
-  id           String     @id @default(cuid())
-  roomNo       String     @unique
-  name         String
-  description  String?
-  type         String?
-  acType       String     @default("AC")
-  capacity     Int        @default(2)
-  price        Int // per night, in whole INR
+  id                 String             @id @default(cuid())
+  roomNo             String             @unique
+  name               String
+  description        String?
+  type               String?
+  acType             String             @default("AC")
+  capacity           Int                @default(2)
+  price              Int // per night, in whole INR
   // Optional nightly rates for premium dates; null falls back to `price`.
   // Resolution order per night: event date → peak season → weekend → normal.
-  weekendPrice Int?
-  peakPrice    Int?
-  eventPrice   Int?
-  photos       String[]   @default([])
-  status       RoomStatus @default(AVAILABLE)
-  amenities    String[]   @default([])
-  createdAt    DateTime   @default(now())
-  updatedAt    DateTime   @updatedAt
+  weekendPrice       Int?
+  peakPrice          Int?
+  eventPrice         Int?
+  photos             String[]           @default([])
+  status             RoomStatus         @default(AVAILABLE)
+  housekeepingStatus HousekeepingStatus @default(CLEAN)
+  amenities          String[]           @default([])
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
 
   bookings     Booking[]
   availability RoomAvailability[]
@@ -199,10 +215,18 @@ model Booking {
   specialRequest String?
 
   // --- dual-booking fields ---
-  source      BookingSource @default(ONLINE)
-  bookedById  String? // manager who created a WALK_IN booking; null for ONLINE
-  paymentMode PaymentMode   @default(ONLINE)
-  addOns      String[]      @default([])
+  source          BookingSource @default(ONLINE)
+  bookedById      String? // manager who created a WALK_IN booking; null for ONLINE
+  paymentMode     PaymentMode   @default(ONLINE)
+  addOns          String[]      @default([])
+  /// Pickup / drop details for the AIRPORT_PICKUP / AIRPORT_DROP add-ons:
+  /// { pickup?: TransferLeg, drop?: TransferLeg } — see lib/transfers.ts.
+  transferDetails Json?
+
+  /// Sequential GST invoice number (e.g. INV/2026-27/000123), assigned the
+  /// first time an invoice is issued — see lib/invoice.ts.
+  invoiceNo  String?   @unique
+  invoicedAt DateTime?
 
   // --- money (whole INR) ---
   baseAmount      Int     @default(0) // room + table charge before add-ons
@@ -210,6 +234,8 @@ model Booking {
   tableAmount     Int     @default(0)
   addOnsAmount    Int     @default(0)
   taxAmount       Int     @default(0)
+  /// { room, table, addOns } — how taxAmount splits, for the GST invoice.
+  taxBreakdown    Json?
   totalPrice      Int // grand total, tax included
   /// What the payment rule asked for up front (see lib/pricing.ts).
   advanceAmount   Int     @default(0)
@@ -235,6 +261,7 @@ model Booking {
 
   checkedInAt  DateTime?
   checkedOutAt DateTime?
+  noShowAt     DateTime?
   cancelledAt  DateTime?
   cancelReason String?
 
@@ -325,6 +352,24 @@ model HotelSettings {
   gstPercent         Int                @default(0)
   tablePricePerGuest Int                @default(500)
 
+  /// FLAT: gstPercent on everything (the original behaviour).
+  /// INDIA_SLABS: room nights by tariff slab, table and add-ons at their own rates.
+  taxMode            TaxMode @default(FLAT)
+  /// Nightly tariff at or below roomGstThreshold → roomGstLowPercent, above → roomGstHighPercent.
+  roomGstThreshold   Int     @default(7500)
+  roomGstLowPercent  Int     @default(5)
+  roomGstHighPercent Int     @default(18)
+  tableGstPercent    Int     @default(5)
+  addOnGstPercent    Int     @default(18)
+  /// Printed on invoices.
+  legalName          String?
+  gstin              String?
+
+  /// Restaurant seating window (HH:MM, IST). The last slot must start at or
+  /// before `restaurantLastSeating`.
+  restaurantOpenTime    String @default("12:00")
+  restaurantLastSeating String @default("22:00")
+
   /// Cancelled at least this many hours before check-in → earlyRefundPercent.
   earlyCancelHours   Int @default(48)
   earlyRefundPercent Int @default(50)
@@ -335,6 +380,12 @@ model HotelSettings {
 
   updatedAt   DateTime @updatedAt
   updatedById String?
+}
+
+/// Per-financial-year invoice sequence, incremented under a row lock.
+model InvoiceCounter {
+  fiscalYear String @id
+  last       Int    @default(0)
 }
 
 model PeakSeason {
@@ -454,6 +505,7 @@ enum BookingStatus {
   CANCELLED
   CHECKED_IN
   CHECKED_OUT
+  NO_SHOW
 }
 
 enum BookingType {
@@ -504,6 +556,23 @@ enum PaymentRecordStatus {
   FAILED
 }
 
+enum OtpPurpose {
+  EMAIL_VERIFY
+  BOOKING_LOOKUP
+}
+
+enum HousekeepingStatus {
+  CLEAN
+  DIRTY
+  IN_PROGRESS
+  INSPECTED
+}
+
+enum TaxMode {
+  FLAT
+  INDIA_SLABS
+}
+
 enum PremiumPaymentRule {
   FULL
   FIRST_NIGHT
@@ -540,4 +609,10 @@ enum ManagerActionType {
   UPDATE_PAYMENT
   PROCESS_REFUND
   UPDATE_SETTINGS
+  TRANSFER_ROOM
+  MARK_NO_SHOW
+  UPDATE_HOUSEKEEPING
+  UPDATE_TRANSFER
+  INVITE_STAFF
+  UPDATE_STAFF
 }

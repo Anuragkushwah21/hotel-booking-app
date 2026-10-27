@@ -3,10 +3,11 @@ import { requireManager } from '@/lib/auth'
 import { prisma } from '@/lib/prisma'
 import { logManagerAction } from '@/lib/manager-log'
 import { notifySafely, sendCheckOutFollowUp } from '@/lib/notifications'
+import { serviceStart } from '@/lib/cancellation'
 import type { BookingStatus, ManagerActionType } from '@prisma/client'
 
 /**
- * POST /api/admin/bookings/[id]/status  { action: "CONFIRM" | "CHECK_IN" | "CHECK_OUT" }
+ * POST /api/admin/bookings/[id]/status  { action: "CONFIRM" | "CHECK_IN" | "CHECK_OUT" | "NO_SHOW" }
  *
  * Front-desk state transitions. Guarded so the desk can't check out a guest who
  * never checked in, or check in a cancelled booking.
@@ -16,6 +17,12 @@ import type { BookingStatus, ManagerActionType } from '@prisma/client'
  * (lib/payment-confirmation.ts). An unpaid online booking is just an
  * in-progress checkout; the desk can settle it with a payment instead
  * (POST /api/admin/bookings/[id]/payments), which also confirms it.
+ *
+ * NO_SHOW closes a CONFIRMED booking whose guest never arrived. It is only
+ * allowed once the check-in time (or table slot) has passed, releases the
+ * inventory (NO_SHOW isn't a blocking status) and refunds nothing, per policy.
+ *
+ * CHECK_OUT marks the room DIRTY for housekeeping.
  *
  * Note: Room.status is deliberately NOT flipped to BOOKED on check-in.
  * Occupancy is derived from bookings; Room.status describes whether the room is
@@ -27,6 +34,7 @@ const TRANSITIONS: Record<string, { from: BookingStatus[]; to: BookingStatus; au
   CONFIRM:   { from: ['PENDING'],              to: 'CONFIRMED',   audit: 'MODIFY_BOOKING' },
   CHECK_IN:  { from: ['CONFIRMED'],            to: 'CHECKED_IN',  audit: 'CHECK_IN' },
   CHECK_OUT: { from: ['CHECKED_IN'],           to: 'CHECKED_OUT', audit: 'CHECK_OUT' },
+  NO_SHOW:   { from: ['CONFIRMED'],            to: 'NO_SHOW',     audit: 'MARK_NO_SHOW' },
 }
 
 export async function POST(
@@ -38,7 +46,9 @@ export async function POST(
 
   try {
     const { id } = await params
-    const { action, notes } = await req.json()
+    const body = await req.json().catch(() => ({}))
+    const action = typeof body?.action === 'string' ? body.action : ''
+    const notes = typeof body?.notes === 'string' ? body.notes.slice(0, 1000) : null
 
     const transition = TRANSITIONS[action]
     if (!transition) {
@@ -74,6 +84,16 @@ export async function POST(
       )
     }
 
+    if (action === 'NO_SHOW') {
+      const start = serviceStart(booking)
+      if (!start || start.getTime() > Date.now()) {
+        return NextResponse.json(
+          { error: 'A booking can be marked as a no-show only after its check-in time has passed', code: 'TOO_EARLY' },
+          { status: 409 },
+        )
+      }
+    }
+
     // Long stays and advance bookings owe a balance at check-in; don't let it
     // slip past the desk unnoticed.
     const balanceDue = booking.totalPrice - booking.paidAmount
@@ -91,16 +111,26 @@ export async function POST(
       }
     }
 
+    // Conditional on the status we validated, so two desks clicking at once
+    // can't apply the transition twice.
+    const claimed = await prisma.booking.updateMany({
+      where: { id, status: booking.status },
+      data: { status: transition.to },
+    })
+    if (claimed.count === 0) {
+      return NextResponse.json({ error: 'This booking was just updated by someone else — refresh and try again' }, { status: 409 })
+    }
+
     const updated = await prisma.booking.update({
       where: { id },
       data: {
-        status: transition.to,
         // Clearing the hold stops an expired online booking being auto-cancelled
         // after the desk has confirmed it.
         holdExpiresAt: null,
         ...(action === 'CHECK_IN' ? { checkedInAt: new Date() } : {}),
         ...(action === 'CHECK_OUT' ? { checkedOutAt: new Date() } : {}),
         ...(action === 'CONFIRM' ? { confirmedAt: new Date() } : {}),
+        ...(action === 'NO_SHOW' ? { noShowAt: new Date(), remainingAmount: 0 } : {}),
       },
       include: {
         room: { select: { name: true, roomNo: true } },
@@ -110,6 +140,9 @@ export async function POST(
 
     // Checking out is what opens up the review, so nudge the guest for one.
     if (action === 'CHECK_OUT') {
+      if (updated.roomId) {
+        await prisma.room.update({ where: { id: updated.roomId }, data: { housekeepingStatus: 'DIRTY' } })
+      }
       notifySafely(() => sendCheckOutFollowUp(updated as any))
     }
 

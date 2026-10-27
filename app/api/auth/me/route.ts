@@ -1,40 +1,22 @@
-import { NextRequest, NextResponse } from 'next/server'
-import { cookies } from 'next/headers'
-import { prisma } from '@/lib/prisma'
-import { getSessionByToken } from '@/lib/auth'
+import { NextResponse } from 'next/server'
+import { getCurrentUser } from '@/lib/auth'
 
-export async function GET(req: NextRequest) {
-  try {
-    const cookieStore = await cookies()
-    const sessionToken = cookieStore.get('session_token')?.value
-
-    if (!sessionToken) {
-      return NextResponse.json({ user: null }, { status: 200 })
-    }
-
-    const session = await getSessionByToken(sessionToken)
-    if (!session) {
-      return NextResponse.json({ user: null }, { status: 200 })
-    }
-
-    const user = await prisma.user.findUnique({
-      where: { id: session.userId },
-      select: {
-        id: true,
-        email: true,
-        name: true,
-        isAdmin: true,
-        role: true,
-      },
-    })
-
-    if (!user) {
-      return NextResponse.json({ user: null }, { status: 200 })
-    }
-
-    return NextResponse.json({ user }, { status: 200 })
-  } catch (error) {
-    console.error('[me] error:', error)
-    return NextResponse.json({ user: null }, { status: 200 })
+/** GET /api/auth/me — the signed-in user, or null (expired, deactivated, signed out). */
+export async function GET() {
+  const user = await getCurrentUser()
+  if (!user) {
+    return NextResponse.json({ user: null }, { status: 200, headers: { 'Cache-Control': 'no-store' } })
   }
+  return NextResponse.json(
+    {
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        isAdmin: user.role === 'ADMIN',
+      },
+    },
+    { status: 200, headers: { 'Cache-Control': 'no-store' } },
+  )
 }

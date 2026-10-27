@@ -1,264 +1,158 @@
-// lib/email.ts
-import { getMailer } from '@/lib/mailer'
+// lib/email.ts — transactional account / OTP emails.
+// Booking notifications live in lib/notifications.ts; both send through the
+// single SMTP transport in lib/mailer.ts.
+
+import { getMailer, mailFrom } from '@/lib/mailer'
 import { prisma } from '@/lib/prisma'
+import { issueOtp, verifyOtp, OTP_TTL_MINUTES, type IssueResult, type VerifyResult } from '@/lib/otp'
+import { escapeHtml } from '@/lib/security'
 
-// -------------------------
-// Transporter setup
-// -------------------------
+const APP_NAME = process.env.NEXT_PUBLIC_APP_NAME || 'HotelBook'
 
-// One SMTP transport for the whole app — see lib/mailer.ts.
-function getTransporter() {
-  return getMailer()
+function layout(title: string, body: string): string {
+  return `
+    <html>
+      <body style="font-family: Arial, sans-serif; background-color: #f5f5f5; padding: 16px;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 24px; border-radius: 8px;">
+          <div style="text-align: center; margin-bottom: 24px;">
+            <div style="font-size: 24px; font-weight: bold; color: #D97706;">${escapeHtml(APP_NAME)}</div>
+            <h1 style="font-size: 20px;">${escapeHtml(title)}</h1>
+          </div>
+          ${body}
+          <p style="text-align: center; color: #999; font-size: 12px; margin-top: 32px;">
+            &copy; ${new Date().getFullYear()} ${escapeHtml(APP_NAME)}
+          </p>
+        </div>
+      </body>
+    </html>`
+}
+
+function codeBlock(code: string): string {
+  return `
+    <div style="font-size: 32px; letter-spacing: 8px; font-weight: bold; text-align: center; padding: 15px; background-color: #f5f5f5; border-radius: 6px; margin: 20px 0;">
+      ${code}
+    </div>
+    <p style="background-color: #fff3cd; padding: 10px; border-radius: 4px;">
+      This code expires in ${OTP_TTL_MINUTES} minutes. Never share it with anyone — hotel staff will never ask for it.
+    </p>`
 }
 
 // -------------------------
-// OTP helpers (email verification by code)
+// Email verification (signup)
 // -------------------------
-
-function generateOtp(): string {
-  // 6-digit
-  return Math.floor(100000 + Math.random() * 900000).toString()
-}
 
 export async function createAndSendEmailOtp(
   email: string,
   name?: string | null,
-) {
+): Promise<{ success: true } | { success: false; reason: 'COOLDOWN' | 'TOO_MANY' | 'SEND_FAILED'; retryAfterSeconds?: number }> {
+  const normalized = email.trim().toLowerCase()
+  const issued = await issueOtp({ purpose: 'EMAIL_VERIFY', subject: normalized, destination: normalized })
+  if (!issued.ok) return { success: false, reason: issued.reason, retryAfterSeconds: issued.retryAfterSeconds }
+
   try {
-    const transporter = getTransporter()
-
-    // Purane unverified OTPs cleanup (optional)
-    await prisma.oTPCode.deleteMany({
-      where: {
-        email,
-        verifiedAt: null,
-      },
+    await getMailer().sendMail({
+      from: mailFrom(),
+      to: normalized,
+      subject: `${APP_NAME} - Your verification code`,
+      html: layout(
+        'Email verification code',
+        `<p>Hi ${escapeHtml(name)},</p>
+         <p>Use the code below to verify your email address.</p>
+         ${codeBlock(issued.code)}
+         <p>If you didn't create this account, you can safely ignore this email.</p>`,
+      ),
     })
-
-    const code = generateOtp()
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000) // 10 min
-
-    await prisma.oTPCode.create({
-      data: {
-        email,
-        code,
-        expiresAt,
-      },
-    })
-
-    const html = `
-      <html>
-        <head>
-          <style>
-            body { font-family: Arial, sans-serif; background-color: #f5f5f5; }
-            .container { max-width: 600px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 8px; }
-            .header { text-align: center; margin-bottom: 30px; }
-            .logo { font-size: 24px; font-weight: bold; color: #D97706; }
-            .code-box {
-              font-size: 32px;
-              letter-spacing: 8px;
-              font-weight: bold;
-              text-align: center;
-              padding: 15px;
-              background-color: #f5f5f5;
-              border-radius: 6px;
-              margin: 20px 0;
-            }
-            .footer { text-align: center; color: #999; font-size: 12px; margin-top: 30px; }
-            .warning { background-color: #fff3cd; padding: 10px; border-radius: 4px; margin: 20px 0; }
-          </style>
-        </head>
-        <body>
-          <div class="container">
-            <div class="header">
-              <div class="logo">HotelBook</div>
-              <h1>Email Verification Code</h1>
-            </div>
-
-            <p>Hi ${name || ''},</p>
-            <p>Thank you for signing up with HotelBook! Use the code below to verify your email address.</p>
-
-            <div class="code-box">
-              ${code}
-            </div>
-
-            <div class="warning">
-              <strong>Note:</strong> This code will expire in 10 minutes.
-            </div>
-
-            <p>If you didn't create this account, you can safely ignore this email.</p>
-
-            <p>Best regards,<br>HotelBook Team</p>
-
-            <div class="footer">
-              <p>&copy; 2024 HotelBook. All rights reserved.</p>
-            </div>
-          </div>
-        </body>
-      </html>
-    `
-
-    await transporter.sendMail({
-      from: `"HotelBook" <${process.env.EMAIL_USER}>`,
-      to: email,
-      subject: 'HotelBook - Your verification code',
-      html,
-    })
-
     return { success: true }
   } catch (error) {
-    console.error('[v0] Error creating/sending email OTP:', error)
-    return { success: false }
+    console.error('[email] verification code send failed:', (error as Error).message)
+    return { success: false, reason: 'SEND_FAILED' }
   }
 }
+
+/** Verify a signup code and mark the account verified. */
+export async function verifyEmailOtp(email: string, code: string): Promise<VerifyResult> {
+  const normalized = email.trim().toLowerCase()
+  const result = await verifyOtp({ purpose: 'EMAIL_VERIFY', subject: normalized, code })
+  if (result.ok) {
+    await prisma.user.updateMany({ where: { email: normalized }, data: { emailVerified: true } })
+  }
+  return result
+}
+
+// -------------------------
+// Guest booking lookup
+// -------------------------
 
 /**
- * Verify OTP and mark user as verified
+ * Send one lookup code to every email address on the matched bookings (a phone
+ * number can match bookings made under different emails). Returns the issue
+ * result so the caller can report cooldowns.
  */
-export async function verifyEmailOtp(email: string, code: string) {
-  try {
-    const now = new Date()
+export async function sendBookingLookupOtp(subject: string, destinations: string[]): Promise<IssueResult> {
+  const issued = await issueOtp({ purpose: 'BOOKING_LOOKUP', subject, destination: destinations.join(',') })
+  if (!issued.ok) return issued
 
-    const otpRecord = await prisma.oTPCode.findFirst({
-      where: {
-        email,
-        code,
-        expiresAt: { gt: now },
-        verifiedAt: null,
-      },
-      orderBy: { createdAt: 'desc' },
-    })
-
-    if (!otpRecord) {
-      return { success: false, reason: 'INVALID_OR_EXPIRED' as const }
-    }
-
-    // attempts + verifiedAt update
-    await prisma.oTPCode.update({
-      where: { id: otpRecord.id },
-      data: {
-        verifiedAt: now,
-        attempts: { increment: 1 },
-      },
-    })
-
-    await prisma.user.update({
-      where: { email },
-      data: { emailVerified: true },
-    })
-
-    return { success: true }
-  } catch (error) {
-    console.error('[v0] Error verifying email OTP:', error)
-    return { success: false, reason: 'SERVER_ERROR' as const }
-  }
+  await Promise.all(
+    destinations.map((to) =>
+      getMailer()
+        .sendMail({
+          from: mailFrom(),
+          to,
+          subject: `${APP_NAME} - Your booking access code`,
+          html: layout(
+            'Booking access code',
+            `<p>Someone asked to view the bookings linked to this email address.</p>
+             ${codeBlock(issued.code)}
+             <p>If this wasn't you, ignore this email — nobody can see your booking without this code.</p>`,
+          ),
+        })
+        .catch((error) => console.error('[email] lookup code send failed:', (error as Error).message)),
+    ),
+  )
+  return issued
 }
 
 // -------------------------
-// (Optional) link-based verification helpers –
-// Agar tum sirf OTP chahte ho, to neeche ka EmailVerificationToken
-// related code ko hata sakte ho / comment kar sakte ho.
-// -------------------------
-
-// NOTE: the link-based EmailVerificationToken helpers were removed — the model
-// they referenced does not exist in schema.prisma, so every call threw at
-// runtime. Verification is OTP-based; see createAndSendEmailOtp/verifyEmailOtp
-// above.
-
-export async function markUserAsVerified(userId: string): Promise<boolean> {
-  try {
-    await prisma.user.update({
-      where: { id: userId },
-      data: {
-        emailVerified: true,
-      },
-    })
-    return true
-  } catch (error) {
-    console.error('[v0] Error marking user as verified (Prisma):', error)
-    return false
-  }
-}
-
-// -------------------------
-// Password reset email (link based) – as you had
+// Password reset / staff invite (link based)
 // -------------------------
 
 export async function sendPasswordResetEmail(
   email: string,
-  name: string,
+  name: string | null,
   resetToken: string,
+  kind: 'RESET' | 'INVITE' = 'RESET',
 ): Promise<boolean> {
+  const link = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/reset-password?token=${encodeURIComponent(resetToken)}`
+  const invite = kind === 'INVITE'
   try {
-    const transporter = getTransporter()
-    const resetLink = `${process.env.NEXT_PUBLIC_APP_URL}/reset-password?token=${resetToken}`
-
-    const mailOptions = {
-      from: process.env.EMAIL_USER,
+    await getMailer().sendMail({
+      from: mailFrom(),
       to: email,
-      subject: 'HotelBook - Reset Your Password',
-      html: `
-        <html>
-          <head>
-            <style>
-              body { font-family: Arial, sans-serif; background-color: #f5f5f5; }
-              .container { max-width: 600px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 8px; }
-              .header { text-align: center; margin-bottom: 30px; }
-              .logo { font-size: 24px; font-weight: bold; color: #D97706; }
-              .content { margin: 20px 0; line-height: 1.6; color: #333; }
-              .button { 
-                display: inline-block; 
-                background-color: #D97706; 
-                color: white; 
-                padding: 12px 30px; 
-                border-radius: 6px; 
-                text-decoration: none; 
-                margin: 20px 0;
-              }
-              .footer { text-align: center; color: #999; font-size: 12px; margin-top: 30px; }
-              .warning { background-color: #fff3cd; padding: 10px; border-radius: 4px; margin: 20px 0; }
-            </style>
-          </head>
-          <body>
-            <div class="container">
-              <div class="header">
-                <div class="logo">HotelBook</div>
-                <h1>Password Reset Request</h1>
-              </div>
-
-              <div class="content">
-                <p>Hi ${name},</p>
-                <p>We received a request to reset your password. Click the button below to set a new password.</p>
-                
-                <div style="text-align: center;">
-                  <a href="${resetLink}" class="button">Reset Password</a>
-                </div>
-
-                <p>Or copy and paste this link in your browser:</p>
-                <p style="word-break: break-all; background-color: #f5f5f5; padding: 10px; border-radius: 4px;">
-                  ${resetLink}
-                </p>
-
-                <div class="warning">
-                  <strong>Note:</strong> This reset link will expire in 1 hour. If you didn't request a password reset, please ignore this email.
-                </div>
-
-                <p>Best regards,<br>HotelBook Team</p>
-              </div>
-
-              <div class="footer">
-                <p>&copy; 2024 HotelBook. All rights reserved.</p>
-              </div>
-            </div>
-          </body>
-        </html>
-      `,
-    }
-
-    await transporter.sendMail(mailOptions)
+      subject: invite ? `${APP_NAME} - You've been invited to the staff dashboard` : `${APP_NAME} - Reset your password`,
+      html: layout(
+        invite ? 'Set up your staff account' : 'Password reset request',
+        `<p>Hi ${escapeHtml(name)},</p>
+         <p>${
+           invite
+             ? `You've been added as a member of staff at ${escapeHtml(APP_NAME)}. Choose a password to activate your account.`
+             : 'We received a request to reset your password. Click the button below to choose a new one.'
+         }</p>
+         <p style="text-align: center;">
+           <a href="${link}" style="display: inline-block; background-color: #D97706; color: white; padding: 12px 30px; border-radius: 6px; text-decoration: none;">
+             ${invite ? 'Set your password' : 'Reset password'}
+           </a>
+         </p>
+         <p>Or paste this link into your browser:</p>
+         <p style="word-break: break-all; background-color: #f5f5f5; padding: 10px; border-radius: 4px;">${link}</p>
+         <p style="background-color: #fff3cd; padding: 10px; border-radius: 4px;">
+           This link expires in ${invite ? '72 hours' : '1 hour'} and can be used once.
+           ${invite ? '' : "If you didn't ask for a reset, ignore this email — your password won't change."}
+         </p>`,
+      ),
+    })
     return true
   } catch (error) {
-    console.error('[v0] Error sending password reset email:', error)
+    console.error('[email] password link send failed:', (error as Error).message)
     return false
   }
 }

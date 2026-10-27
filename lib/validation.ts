@@ -5,6 +5,7 @@
 
 import { NextResponse } from 'next/server'
 import { z } from 'zod'
+import { guestTransferSchema } from './transfers'
 
 export const dateString = z
   .string()
@@ -37,8 +38,17 @@ export const roomBookingSchema = z
     guestCount: z.coerce.number().int().min(1).max(20),
     addOns: z.array(z.string()).optional().default([]),
     table: tableRequest.optional().nullable(),
+    transfer: guestTransferSchema.optional().nullable(),
     ...guestDetails,
   })
+  .refine(
+    (v) => !v.addOns.includes('AIRPORT_PICKUP') || !v.transfer || v.transfer.pickup,
+    { message: 'Add your arrival details for the airport pickup', path: ['transfer', 'pickup'] },
+  )
+  .refine(
+    (v) => !v.addOns.includes('AIRPORT_DROP') || !v.transfer || v.transfer.drop,
+    { message: 'Add your departure details for the airport drop', path: ['transfer', 'drop'] },
+  )
   .refine((v) => v.checkOutDate.slice(0, 10) > v.checkInDate.slice(0, 10), {
     message: 'Check-out must be after check-in',
     path: ['checkOutDate'],
@@ -149,8 +159,29 @@ export const settingsSchema = z
     earlyRefundPercent: z.coerce.number().int().min(0).max(100),
     lateCancelHours: z.coerce.number().int().min(0).max(720),
     lateRefundPercent: z.coerce.number().int().min(0).max(100),
+    taxMode: z.enum(['FLAT', 'INDIA_SLABS']),
+    roomGstThreshold: z.coerce.number().int().min(0).max(1_000_000),
+    roomGstLowPercent: z.coerce.number().int().min(0).max(28),
+    roomGstHighPercent: z.coerce.number().int().min(0).max(28),
+    tableGstPercent: z.coerce.number().int().min(0).max(28),
+    addOnGstPercent: z.coerce.number().int().min(0).max(28),
+    legalName: optionalText(200),
+    gstin: z
+      .string()
+      .trim()
+      .toUpperCase()
+      .regex(/^$|^[0-9]{2}[A-Z0-9]{10}[0-9A-Z]{3}$/, 'GSTIN must be 15 characters (e.g. 08ABCDE1234F1Z5)')
+      .optional()
+      .nullable()
+      .transform((v) => (v ? v : null)),
+    restaurantOpenTime: timeString,
+    restaurantLastSeating: timeString,
   })
   .partial()
+  .refine(
+    (v) => v.restaurantOpenTime == null || v.restaurantLastSeating == null || v.restaurantOpenTime <= v.restaurantLastSeating,
+    { message: 'Last seating must be after opening time', path: ['restaurantLastSeating'] },
+  )
   .refine(
     (v) => v.earlyCancelHours == null || v.lateCancelHours == null || v.earlyCancelHours >= v.lateCancelHours,
     { message: 'The early window must be at least as long as the late window', path: ['earlyCancelHours'] },

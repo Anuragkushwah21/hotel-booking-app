@@ -1,49 +1,33 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { prisma } from '@/lib/prisma'
+import { z } from 'zod'
+import { verifyEmailOtp } from '@/lib/email'
+import { otpErrorMessage } from '@/lib/otp'
+import { parseJson } from '@/lib/validation'
+import { rateLimit, tooManyRequests } from '@/lib/rate-limit'
+import { clientIp } from '@/lib/security'
+
+const schema = z.object({
+  email: z.string().trim().toLowerCase().email(),
+  code: z.string().trim().regex(/^\d{6}$/, 'Enter the 6-digit code'),
+})
 
 export async function POST(req: NextRequest) {
+  const parsed = await parseJson(req, schema)
+  if (!parsed.ok) return parsed.response
+
+  // Per-code attempts are limited in lib/otp.ts; this caps guessing across
+  // many accounts from one client.
+  const rl = await rateLimit(`otp-verify:ip:${clientIp(req)}`, 30, 15 * 60)
+  if (!rl.ok) return tooManyRequests(rl)
+
   try {
-    const body = await req.json()
-    const { email, code } = body
-
-    if (!email || !code) {
+    const result = await verifyEmailOtp(parsed.data.email, parsed.data.code)
+    if (!result.ok) {
       return NextResponse.json(
-        { error: 'Email and code are required' },
+        { error: otpErrorMessage(result), attemptsLeft: result.attemptsLeft },
         { status: 400 },
       )
     }
-
-    const now = new Date()
-
-    const otpRecord = await prisma.oTPCode.findFirst({
-      where: {
-        email,
-        code,
-        expiresAt: { gt: now },
-        verifiedAt: null,
-      },
-      orderBy: { createdAt: 'desc' },
-    })
-
-    if (!otpRecord) {
-      return NextResponse.json(
-        { error: 'Invalid or expired code' },
-        { status: 400 },
-      )
-    }
-
-    await prisma.oTPCode.update({
-      where: { id: otpRecord.id },
-      data: {
-        verifiedAt: now,
-        attempts: { increment: 1 },
-      },
-    })
-
-    await prisma.user.update({
-      where: { email },
-      data: { emailVerified: true },
-    })
 
     return NextResponse.json(
       { message: 'Email verified successfully' },

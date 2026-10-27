@@ -14,6 +14,7 @@ import type { BookingStatus, BookingType, PaymentStatus, Prisma, RefundStatus } 
  *   status   PENDING|CONFIRMED|CHECKED_IN|CHECKED_OUT|CANCELLED  (repeatable)
  *   payment  PENDING|PARTIALLY_PAID|PAID|FAILED|REFUNDED
  *   refund   REFUND_PENDING|REFUND_PROCESSED|REFUND_REJECTED
+ *   addOn    add-on code, e.g. AIRPORT_PICKUP
  *   from,to  YYYY-MM-DD (IST) — filters on the stay/reservation date, not createdAt
  *   q        guest name / email / phone / booking number / id
  *   holds    1 → include unpaid online checkouts (hidden by default: they are
@@ -21,7 +22,7 @@ import type { BookingStatus, BookingType, PaymentStatus, Prisma, RefundStatus } 
  *   page,limit
  */
 const TYPES: BookingType[] = ['ROOM', 'TABLE', 'ROOM_TABLE']
-const STATUSES: BookingStatus[] = ['PENDING', 'CONFIRMED', 'CHECKED_IN', 'CHECKED_OUT', 'CANCELLED']
+const STATUSES: BookingStatus[] = ['PENDING', 'CONFIRMED', 'CHECKED_IN', 'CHECKED_OUT', 'CANCELLED', 'NO_SHOW']
 const PAYMENTS: PaymentStatus[] = ['PENDING', 'PARTIALLY_PAID', 'PAID', 'FAILED', 'REFUNDED']
 const REFUNDS: RefundStatus[] = ['REFUND_PENDING', 'REFUND_PROCESSED', 'REFUND_REJECTED']
 
@@ -48,6 +49,10 @@ export async function GET(req: NextRequest) {
 
     const refund = sp.get('refund') as RefundStatus | null
     if (refund && REFUNDS.includes(refund)) and.push({ refundStatus: refund })
+
+    // Add-on filter, e.g. addOn=AIRPORT_PICKUP for the pickups board.
+    const addOn = sp.get('addOn')
+    if (addOn && /^[A-Z_]{2,40}$/.test(addOn)) and.push({ addOns: { has: addOn } })
 
     // Date range applies to when the guest is actually here (IST days).
     const from = sp.get('from')

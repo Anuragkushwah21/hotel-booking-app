@@ -1,6 +1,7 @@
 import { AuthProvider } from '@/components/auth-provider'
 import { Header } from '@/components/header'
 import { Footer } from '@/components/footer'
+import { WhatsAppButton } from '@/components/site/whatsapp-button'
 
 /**
  * Chrome for the public-facing site only.
@@ -17,6 +18,7 @@ export default function SiteLayout({ children }: { children: React.ReactNode }) 
         <main className="flex-1">{children}</main>
         <Footer />
       </div>
+      <WhatsAppButton />
     </AuthProvider>
   )
 }

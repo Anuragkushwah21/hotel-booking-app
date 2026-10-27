@@ -5,7 +5,7 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import { toast } from 'react-toastify'
 import {
-  BedDouble, Calendar, KeyRound, Loader2, Mail, MessageSquare, Phone, Search,
+  BedDouble, Calendar, FileText, KeyRound, Loader2, Mail, MessageSquare, Phone, Search,
   UtensilsCrossed, Users, X,
 } from 'lucide-react'
 import { Card } from '@/components/ui/card'
@@ -208,7 +208,7 @@ function MyBookingsContent() {
                     <p className="mt-1 text-sm tabular-nums">
                       Paid <span className="font-semibold">{formatINR(booking.paidAmount)}</span>
                     </p>
-                    {booking.remainingAmount > 0 && booking.status !== 'CANCELLED' && (
+                    {booking.remainingAmount > 0 && !['CANCELLED', 'NO_SHOW'].includes(booking.status) && (
                       <p className="text-sm tabular-nums text-amber-700">
                         Due at check-in {formatINR(booking.remainingAmount)}
                       </p>
@@ -278,7 +278,15 @@ function MyBookingsContent() {
                     Booked on {formatDate(booking.createdAt)}
                     {booking.paymentRuleLabel ? ` · ${booking.paymentRuleLabel}` : ''}
                   </p>
-                  <div className="flex gap-2">
+                  <div className="flex flex-wrap gap-2">
+                    {['CONFIRMED', 'CHECKED_IN', 'CHECKED_OUT'].includes(booking.status) && (
+                      <Button variant="outline" size="sm" asChild>
+                        <Link href={`/invoice/${booking.id}`} target="_blank" rel="noopener">
+                          <FileText className="mr-2 h-4 w-4" aria-hidden />
+                          Download invoice
+                        </Link>
+                      </Button>
+                    )}
                     {booking.status !== 'PENDING' && booking.status !== 'CANCELLED' && (
                       <Button variant="outline" size="sm" asChild>
                         <Link href={`/booking-confirmed/${booking.id}`}>View details</Link>

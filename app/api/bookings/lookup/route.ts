@@ -1,116 +1,79 @@
 import { NextRequest, NextResponse } from 'next/server'
-import type { Prisma } from '@prisma/client'
-import { prisma } from '@/lib/prisma'
-import { normalizeBookingRef } from '@/lib/booking-reference'
-import { getHotelSettings } from '@/lib/settings'
-import { guestBookingInclude, toGuestBookingView } from '@/lib/booking-view'
+import { z } from 'zod'
+import { parseJson } from '@/lib/validation'
+import { lookupDestinations, parseLookupQuery } from '@/lib/booking-lookup'
+import { sendBookingLookupOtp } from '@/lib/email'
+import { OTP_RESEND_COOLDOWN_SECONDS } from '@/lib/otp'
+import { rateLimit, tooManyRequests } from '@/lib/rate-limit'
+import { clientIp, maskEmail } from '@/lib/security'
 
 /**
- * POST /api/bookings/lookup  { query }
+ * POST /api/bookings/lookup  { query }   — step 1 of the guest lookup.
  *
- * Guests without an account can look up a booking using one of: booking
- * number, email address, or mobile number. Email/phone can belong to more
- * than one booking, so those searches return a list rather than silently
- * picking an arbitrary stay.
+ * Accepts a booking number, email address or mobile number and emails a
+ * 6-digit code to the address on the matching booking(s). It never returns
+ * booking data: that only comes back from /api/bookings/lookup/verify once
+ * the code is entered. See lib/booking-lookup.ts.
  */
 
-const GENERIC_MISS = "We couldn't find any bookings with those details. Please check and try again."
+const schema = z.object({
+  // `bookingId` is the field name older forms used.
+  query: z.string().trim().max(120).optional(),
+  bookingId: z.string().trim().max(120).optional(),
+})
 
-// Per-instance throttle. Serverless spreads requests across instances so this
-// is a speed bump, not a guarantee — put a real limiter at the edge if abuse shows up.
-const ATTEMPT_WINDOW_MS = 60_000
-const MAX_ATTEMPTS = 10
-const attempts = new Map<string, { count: number; resetAt: number }>()
-
-function rateLimited(ip: string): boolean {
-  const now = Date.now()
-  const entry = attempts.get(ip)
-
-  if (!entry || entry.resetAt < now) {
-    attempts.set(ip, { count: 1, resetAt: now + ATTEMPT_WINDOW_MS })
-    return false
-  }
-
-  entry.count += 1
-  return entry.count > MAX_ATTEMPTS
-}
-
-function phoneCandidates(value: string): string[] {
-  const digits = value.replace(/\D/g, '')
-  return [...new Set([value, value.replace(/[\s-]/g, ''), digits, digits ? `+${digits}` : ''])].filter(Boolean)
-}
+const MESSAGE =
+  'If we found a booking with those details, we have emailed a 6-digit code to the address on the booking.'
 
 export async function POST(req: NextRequest) {
-  try {
-    const ip =
-      req.headers.get('x-forwarded-for')?.split(',')[0].trim() ||
-      req.headers.get('x-real-ip') ||
-      'unknown'
+  const parsed = await parseJson(req, schema)
+  if (!parsed.ok) return parsed.response
+  const raw = parsed.data.query || parsed.data.bookingId || ''
 
-    if (rateLimited(ip)) {
+  if (!raw) {
+    return NextResponse.json(
+      { error: 'Enter a booking number, email address, or mobile number.' },
+      { status: 400 },
+    )
+  }
+
+  const rl = await rateLimit(`lookup:ip:${clientIp(req)}`, 10, 10 * 60)
+  if (!rl.ok) return tooManyRequests(rl, 'Too many lookups. Please wait a few minutes and try again.')
+
+  const lookup = parseLookupQuery(raw)
+  if (!lookup) {
+    return NextResponse.json(
+      { error: 'Enter a booking number (e.g. HB-7K4M2Q), an email address, or a mobile number.' },
+      { status: 400 },
+    )
+  }
+
+  try {
+    const destinations = await lookupDestinations(lookup)
+    if (destinations.length === 0) {
+      return NextResponse.json({
+        success: true,
+        message: MESSAGE,
+        destinationHint: null,
+        resendAfterSeconds: OTP_RESEND_COOLDOWN_SECONDS,
+      })
+    }
+
+    const issued = await sendBookingLookupOtp(lookup.subject, destinations)
+    if (!issued.ok && issued.reason === 'TOO_MANY') {
       return NextResponse.json(
-        { error: 'Too many attempts. Please wait a minute and try again.' },
+        { error: 'Too many codes requested. Please try again later.', retryAfterSeconds: issued.retryAfterSeconds },
         { status: 429 },
       )
     }
 
-    const body = await req.json()
-    // Keep the old payload fields as a fallback for old links/forms.
-    const query = typeof body?.query === 'string'
-      ? body.query.trim()
-      : typeof body?.bookingId === 'string'
-        ? body.bookingId.trim()
-        : ''
-
-    if (!query) {
-      return NextResponse.json(
-        { error: 'Enter a booking number, email address, or mobile number.' },
-        { status: 400 },
-      )
-    }
-
-    const reference = normalizeBookingRef(query)
-    const email = query.toLowerCase()
-    const looksLikeEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
-    const phones = phoneCandidates(query)
-    const looksLikePhone = phones.some((phone) => phone.replace(/\D/g, '').length >= 7)
-
-    const where: Prisma.BookingWhereInput = reference
-      ? { reference }
-      : looksLikeEmail
-        ? {
-            OR: [
-              { guestEmail: { equals: email, mode: 'insensitive' as const } },
-              { user: { is: { email: { equals: email, mode: 'insensitive' as const } } } },
-            ],
-          }
-        : looksLikePhone
-          ? {
-              OR: [
-                { guestPhone: { in: phones } },
-                { user: { is: { phone: { in: phones } } } },
-              ],
-            }
-          : { id: query }
-
-    const bookings = await prisma.booking.findMany({
-      where,
-      include: guestBookingInclude,
-      orderBy: { createdAt: 'desc' },
-      take: 20,
+    return NextResponse.json({
+      success: true,
+      message: MESSAGE,
+      destinationHint: destinations.map(maskEmail).join(', '),
+      // On a cooldown the previous code is still valid; just say when a new one can be sent.
+      resendAfterSeconds: issued.ok ? OTP_RESEND_COOLDOWN_SECONDS : issued.retryAfterSeconds,
     })
-
-    if (bookings.length === 0) {
-      return NextResponse.json({ error: GENERIC_MISS }, { status: 404 })
-    }
-
-    const settings = await getHotelSettings()
-    const views = bookings.map((booking) => {
-      const { guestEmail: _email, ...view } = toGuestBookingView(booking, settings)
-      return { ...view, baseAmount: booking.baseAmount }
-    })
-
-    return NextResponse.json({ success: true, bookings: views, booking: views[0] })
   } catch (error) {
     console.error('[bookings/lookup] POST error:', error)
     return NextResponse.json({ error: 'Failed to look up booking' }, { status: 500 })

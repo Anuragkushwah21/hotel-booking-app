@@ -1,23 +1,13 @@
 import { createHmac, timingSafeEqual } from 'crypto'
+import { cookies } from 'next/headers'
 import type { NextRequest, NextResponse } from 'next/server'
+import { serverSecret } from './security'
 
 const COOKIE_PREFIX = 'booking_access_'
 const MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 
-function secret(): string {
-  // DATABASE_URL is always server-only and gives existing installations a
-  // stable fallback. Set BOOKING_ACCESS_SECRET explicitly when deploying.
-  const value =
-    process.env.BOOKING_ACCESS_SECRET ??
-    process.env.SESSION_SECRET ??
-    process.env.DATABASE_URL
-
-  if (!value) throw new Error('A server secret is required for guest booking access')
-  return value
-}
-
 function signature(bookingId: string, expiresAt: number): string {
-  return createHmac('sha256', secret())
+  return createHmac('sha256', serverSecret())
     .update(`booking-access:v1:${bookingId}:${expiresAt}`)
     .digest('base64url')
 }
@@ -40,9 +30,7 @@ export function grantBookingAccess(response: NextResponse, bookingId: string): v
   })
 }
 
-/** True only when this browser holds the unexpired signed token for this booking. */
-export function hasBookingAccess(req: NextRequest, bookingId: string): boolean {
-  const value = req.cookies.get(cookieName(bookingId))?.value
+function validToken(bookingId: string, value: string | undefined): boolean {
   if (!value) return false
 
   const [expiresRaw, provided] = value.split('.')
@@ -58,4 +46,15 @@ export function hasBookingAccess(req: NextRequest, bookingId: string): boolean {
     providedBuffer.length === expectedBuffer.length &&
     timingSafeEqual(providedBuffer, expectedBuffer)
   )
+}
+
+/** True only when this browser holds the unexpired signed token for this booking. */
+export function hasBookingAccess(req: NextRequest, bookingId: string): boolean {
+  return validToken(bookingId, req.cookies.get(cookieName(bookingId))?.value)
+}
+
+/** Same check for server components, which have no NextRequest. */
+export async function hasBookingAccessCookie(bookingId: string): Promise<boolean> {
+  const store = await cookies()
+  return validToken(bookingId, store.get(cookieName(bookingId))?.value)
 }

@@ -7,6 +7,7 @@ import { z } from 'zod'
 import { toast } from 'react-toastify'
 import {
   ArrowLeft, BedDouble, CalendarDays, Clock, Loader2, Lock, UtensilsCrossed, Users, AlertCircle,
+  PlaneLanding, PlaneTakeoff,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -17,6 +18,10 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useAuth } from '@/components/auth-provider'
 import { PayButton } from '@/components/site/pay-button'
 import { PriceSummary, PolicyList, slotLabel } from '@/components/site/price-summary'
+import {
+  MODE_LABELS, TransferLegFields, emptyLeg, legWhenLabel, toLegPayload, validateLeg,
+  type TransferLegErrors, type TransferLegForm, type TransferLegKind,
+} from '@/components/site/transfer-details'
 import { formatDate, formatINR } from '@/lib/format'
 import { HOTEL } from '@/lib/hotel'
 import type { Quote } from '@/lib/pricing'
@@ -78,6 +83,8 @@ function CheckoutContent() {
   const tableTime = tableOnly ? sp.get('time') || '' : sp.get('tableTime') || ''
   const tableGuests = tableOnly ? guests : Math.max(1, Number(sp.get('tableGuests')) || guests)
   const withTable = Boolean(tableDate && tableTime)
+  const wantsPickup = !tableOnly && addOns.includes('AIRPORT_PICKUP')
+  const wantsDrop = !tableOnly && addOns.includes('AIRPORT_DROP')
 
   const [room, setRoom] = useState<RoomInfo | null>(null)
   const [quote, setQuote] = useState<Quote | null>(null)
@@ -92,6 +99,24 @@ function CheckoutContent() {
   const [submitting, setSubmitting] = useState(false)
   const [held, setHeld] = useState<Held | null>(null)
   const countdown = useCountdown(held?.holdExpiresAt ?? null)
+
+  const [legs, setLegs] = useState<Record<TransferLegKind, TransferLegForm>>(() => ({
+    pickup: emptyLeg(guests),
+    drop: emptyLeg(guests),
+  }))
+  const [legErrors, setLegErrors] = useState<Record<TransferLegKind, TransferLegErrors>>({ pickup: {}, drop: {} })
+  const selectedLegs: TransferLegKind[] = [
+    ...(wantsPickup ? (['pickup'] as const) : []),
+    ...(wantsDrop ? (['drop'] as const) : []),
+  ]
+  const patchLeg = (kind: TransferLegKind) => (patch: Partial<TransferLegForm>) => {
+    setLegs((l) => ({ ...l, [kind]: { ...l[kind], ...patch } }))
+    setLegErrors((er) => {
+      const next = { ...er[kind] }
+      for (const k of Object.keys(patch) as (keyof TransferLegForm)[]) delete next[k]
+      return { ...er, [kind]: next }
+    })
+  }
 
   useEffect(() => {
     if (!user) return
@@ -160,6 +185,12 @@ function CheckoutContent() {
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
     const parsed = guestForm.safeParse(form)
+    const nextLegErrors = {
+      pickup: wantsPickup ? validateLeg(legs.pickup, 'pickup') : {},
+      drop: wantsDrop ? validateLeg(legs.drop, 'drop') : {},
+    }
+    const legsInvalid = selectedLegs.some((k) => Object.keys(nextLegErrors[k]).length > 0)
+    setLegErrors(nextLegErrors)
     if (!parsed.success) {
       const next: typeof errors = {}
       for (const issue of parsed.error.issues) next[issue.path[0] as keyof typeof form] ??= issue.message
@@ -167,6 +198,19 @@ function CheckoutContent() {
       toast.error(parsed.error.issues[0]?.message ?? 'Please check your details')
       return
     }
+    if (legsInvalid) {
+      const first = selectedLegs.find((k) => Object.keys(nextLegErrors[k]).length > 0)!
+      toast.error(`Please complete the ${first} details`)
+      document.getElementById(`transfer-${first}-at`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      return
+    }
+    const transfer =
+      selectedLegs.length > 0
+        ? {
+            ...(wantsPickup ? { pickup: toLegPayload(legs.pickup) } : {}),
+            ...(wantsDrop ? { drop: toLegPayload(legs.drop) } : {}),
+          }
+        : undefined
 
     setSubmitting(true)
     try {
@@ -192,6 +236,7 @@ function CheckoutContent() {
               guestCount: guests,
               addOns,
               table: withTable ? { date: tableDate, time: tableTime, guestCount: tableGuests } : null,
+              ...(transfer ? { transfer } : {}),
               ...guest,
             }),
           })
@@ -286,6 +331,29 @@ function CheckoutContent() {
               </div>
             </div>
 
+            {selectedLegs.length > 0 && (
+              <div className="space-y-3 pt-2">
+                <div>
+                  <h2 className="text-lg font-semibold">
+                    {selectedLegs.length === 2 ? 'Pickup & drop' : selectedLegs[0] === 'pickup' ? 'Airport pickup' : 'Airport drop'}
+                  </h2>
+                  <p className="text-sm text-muted-foreground">
+                    Tell us when and where, so your driver is there on time.
+                  </p>
+                </div>
+                {selectedLegs.map((kind) => (
+                  <TransferLegFields
+                    key={kind}
+                    kind={kind}
+                    value={legs[kind]}
+                    errors={legErrors[kind]}
+                    onChange={patchLeg(kind)}
+                    disabled={!!held}
+                  />
+                ))}
+              </div>
+            )}
+
             {tableNote && (
               <p className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
                 <UtensilsCrossed className="mt-0.5 h-4 w-4 flex-shrink-0" aria-hidden />
@@ -369,6 +437,24 @@ function CheckoutContent() {
                   {HOTEL.dining.name} · {formatDate(tableDate)}, {slotLabel(tableTime)} · {tableGuests} diner{tableGuests === 1 ? '' : 's'}
                 </p>
               )}
+              {selectedLegs.map((kind) => {
+                const leg = legs[kind]
+                const LegIcon = kind === 'pickup' ? PlaneLanding : PlaneTakeoff
+                const when = legWhenLabel(leg.at)
+                return (
+                  <div key={kind} className="flex items-start gap-2">
+                    <LegIcon className="mt-0.5 h-4 w-4 flex-shrink-0 text-muted-foreground" aria-hidden />
+                    <div className="min-w-0">
+                      <p>{kind === 'pickup' ? 'Pickup' : 'Drop'}{when ? ` · ${when}` : ''}</p>
+                      <p className="break-words text-xs text-muted-foreground">
+                        {leg.location.trim() || (kind === 'pickup' ? 'Pickup location to be added' : 'Drop location to be added')}
+                        {leg.number.trim() ? ` · ${MODE_LABELS[leg.mode]} ${leg.number.trim().toUpperCase()}` : ''}
+                        {Number(leg.passengers) > 0 ? ` · ${leg.passengers} pax` : ''}
+                      </p>
+                    </div>
+                  </div>
+                )
+              })}
             </div>
 
             <div className="p-4">

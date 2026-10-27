@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import {
-  AlertTriangle, BedDouble, CalendarDays, CheckCircle2, Clock, KeyRound, Mail, Phone,
+  AlertTriangle, BedDouble, CalendarDays, CheckCircle2, Clock, FileText, KeyRound, Mail, Phone,
   RotateCcw, UtensilsCrossed, Users,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -109,7 +109,18 @@ export default function BookingConfirmedPage() {
         </div>
       ) : (
         <div className="rounded-2xl border border-border bg-muted/40 p-6 text-center">
-          <h1 className="text-2xl font-bold">This booking is {booking.status.toLowerCase().replace('_', ' ')}</h1>
+          <h1 className="text-2xl font-bold">
+            {booking.status === 'CANCELLED'
+              ? 'This booking was cancelled'
+              : (booking.status as string) === 'NO_SHOW'
+                ? 'This booking was marked as a no-show'
+                : `This booking is ${String(booking.status).toLowerCase().replace(/_/g, ' ')}`}
+          </h1>
+          {(booking.status as string) === 'NO_SHOW' && (
+            <p className="mt-1 text-muted-foreground">
+              We didn&apos;t see you on the booked date. Questions? Call us on {HOTEL.contact.phone}.
+            </p>
+          )}
         </div>
       )}
 
@@ -172,7 +183,7 @@ export default function BookingConfirmedPage() {
             {booking.taxAmount > 0 && <Line label="GST" value={formatINR(booking.taxAmount)} />}
             <div className="border-t border-border pt-1.5"><Line strong label="Total" value={formatINR(booking.totalPrice)} /></div>
             <Line label="Amount paid" value={formatINR(booking.paidAmount)} />
-            {booking.remainingAmount > 0 && (
+            {booking.remainingAmount > 0 && !['CANCELLED', 'NO_SHOW'].includes(booking.status) && (
               <Line strong label="Balance due at check-in" value={formatINR(booking.remainingAmount)} />
             )}
             {booking.refundAmount > 0 && <Line label="Refund" value={formatINR(booking.refundAmount)} />}
@@ -188,6 +199,14 @@ export default function BookingConfirmedPage() {
             <p className="flex items-center gap-2"><Phone className="h-4 w-4" aria-hidden />{HOTEL.contact.phone}</p>
           </div>
           <div className="flex flex-wrap gap-2">
+            {confirmed && (
+              <Button variant="outline" asChild>
+                <Link href={`/invoice/${booking.id}`} target="_blank" rel="noopener">
+                  <FileText className="mr-2 h-4 w-4" aria-hidden />
+                  Download invoice
+                </Link>
+              </Button>
+            )}
             <Button variant="outline" asChild><Link href="/rooms">Book another</Link></Button>
             <Button asChild><Link href="/bookings">Go to My Bookings</Link></Button>
           </div>

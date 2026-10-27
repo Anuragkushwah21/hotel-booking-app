@@ -15,6 +15,7 @@ const STATUS: Record<string, { label: string; className: string }> = {
   CHECKED_IN: { label: 'Checked in', className: 'border-blue-200 bg-blue-50 text-blue-800' },
   CHECKED_OUT: { label: 'Completed', className: 'border-zinc-200 bg-zinc-50 text-zinc-700' },
   CANCELLED: { label: 'Cancelled', className: 'border-rose-200 bg-rose-50 text-rose-800' },
+  NO_SHOW: { label: 'No-show', className: 'border-stone-300 bg-stone-100 text-stone-700' },
 }
 
 export function BookingStatusBadge({ status }: { status: string }) {

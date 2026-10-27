@@ -6,7 +6,7 @@ import { useSearchParams } from 'next/navigation'
 import {
   PlusCircle, Search, Inbox, LogIn, LogOut, XCircle, Check,
   RefreshCw, X, SlidersHorizontal,
-  BedDouble, UtensilsCrossed,
+  BedDouble, UtensilsCrossed, PanelRightOpen, PlaneLanding,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -14,22 +14,28 @@ import { Label } from '@/components/ui/label'
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select'
-import { SourceBadge, StatusBadge, PaymentBadge, TypeBadge } from '@/components/admin/booking-badges'
+import {
+  SourceBadge, StatusBadge, PaymentBadge, RefundBadge, TypeBadge,
+} from '@/components/admin/booking-badges'
 import {
   PageHeader, Panel, StatCard, StatCardSkeleton, EmptyState,
   ErrorState, TableSkeleton, inr,
 } from '@/components/admin/ui'
 import { useToast } from '@/hooks/use-toast'
 import { cn } from '@/lib/utils'
+import { dateKey } from '@/lib/format'
+import { BookingDetailDrawer, type DrawerPanel } from '@/components/admin/bookings/booking-detail-drawer'
 
 type Booking = {
   id: string
   reference: string
-  type: 'ROOM' | 'TABLE'
+  type: 'ROOM' | 'TABLE' | 'ROOM_TABLE'
   source: 'ONLINE' | 'WALK_IN'
   status: string
   paymentStatus: string
   paymentMode: string
+  refundStatus?: string
+  addOns?: string[]
   guestName: string
   guestEmail: string
   guestPhone: string | null
@@ -65,7 +71,9 @@ const dayTime = (d: string | null) =>
       })
     : '—'
 
-const EMPTY_FILTERS = { source: ALL, type: ALL, status: ALL, payment: ALL, from: '', to: '', q: '' }
+const EMPTY_FILTERS = {
+  source: ALL, type: ALL, status: ALL, payment: ALL, addOn: ALL, from: '', to: '', q: '',
+}
 
 function AdminBookingsContent() {
   const searchParams = useSearchParams()
@@ -80,8 +88,14 @@ function AdminBookingsContent() {
   const [filters, setFilters] = useState({
     ...EMPTY_FILTERS,
     source: searchParams.get('source') ?? ALL,
+    q: searchParams.get('q') ?? '',
   })
   const [page, setPage] = useState(1)
+  // ?booking=<id> deep-links straight into the detail drawer (used by Payments).
+  const [drawer, setDrawer] = useState<{ id: string; panel: DrawerPanel } | null>(() => {
+    const id = searchParams.get('booking')
+    return id ? { id, panel: null } : null
+  })
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -145,38 +159,14 @@ function AdminBookingsContent() {
     }
   }
 
-  const cancel = async (b: Booking) => {
-    const reason = prompt(`Cancel booking for ${b.guestName}?\n\nReason (optional):`)
-    if (reason === null) return
+  const openDrawer = (id: string, panel: DrawerPanel = null) => setDrawer({ id, panel })
 
-    let refund = 0
-    if (b.paymentStatus === 'PAID') {
-      const input = prompt(`Refund amount (0 – ${b.totalPrice}):`, String(b.totalPrice))
-      if (input === null) return
-      refund = Number(input) || 0
-    }
-
-    setBusy(b.id)
-    try {
-      const res = await fetch(`/api/admin/bookings/${b.id}`, {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reason, refundAmount: refund }),
-      })
-      const body = await res.json()
-      if (!res.ok) throw new Error(body.error)
-      toast({ title: body.message })
-      await load()
-    } catch (e) {
-      toast({
-        title: 'Cancellation failed',
-        description: e instanceof Error ? e.message : 'Unknown error',
-        variant: 'destructive',
-      })
-    } finally {
-      setBusy(null)
-    }
-  }
+  // The list route may not filter on add-ons yet; narrow the page client-side
+  // too so the pickup view never shows unrelated bookings.
+  const rows = (data?.bookings ?? []).filter(
+    (b) => filters.addOn === ALL || (b.addOns ?? []).includes(filters.addOn),
+  )
+  const pickupsActive = filters.addOn === 'AIRPORT_PICKUP'
 
   return (
     <div>
@@ -271,6 +261,24 @@ function AdminBookingsContent() {
             )}
           </Button>
 
+          <Button
+            variant={pickupsActive ? 'secondary' : 'outline'}
+            size="sm"
+            className="h-9"
+            title="Bookings with the airport pickup add-on, arriving from today"
+            onClick={() => {
+              setPage(1)
+              setFilters((f) =>
+                pickupsActive
+                  ? { ...f, addOn: ALL, from: '' }
+                  : { ...f, addOn: 'AIRPORT_PICKUP', from: dateKey(new Date()) },
+              )
+            }}
+          >
+            <PlaneLanding className="mr-1.5 h-3.5 w-3.5" />
+            Upcoming pickups
+          </Button>
+
           {(activeFilterCount > 0 || filters.q) && (
             <Button
               variant="ghost" size="sm" className="h-9 text-muted-foreground"
@@ -288,6 +296,10 @@ function AdminBookingsContent() {
         {showFilters && (
           <div className="mt-4 grid gap-3 border-t border-border/70 pt-4 sm:grid-cols-2 lg:grid-cols-6">
             <FilterSelect
+              label="Add-on" value={filters.addOn} onChange={(v) => setFilter('addOn', v)}
+              options={[[ALL, 'Any add-ons'], ['AIRPORT_PICKUP', 'Airport pickup'], ['AIRPORT_DROP', 'Airport drop']]}
+            />
+            <FilterSelect
               label="Source" value={filters.source} onChange={(v) => setFilter('source', v)}
               options={[[ALL, 'All sources'], ['ONLINE', 'Online'], ['WALK_IN', 'Walk-in']]}
             />
@@ -296,6 +308,7 @@ function AdminBookingsContent() {
               options={[
                 [ALL, 'All statuses'], ['PENDING', 'Pending'], ['CONFIRMED', 'Confirmed'],
                 ['CHECKED_IN', 'Checked in'], ['CHECKED_OUT', 'Checked out'], ['CANCELLED', 'Cancelled'],
+                ['NO_SHOW', 'No-show'],
               ]}
             />
             <FilterSelect
@@ -329,7 +342,7 @@ function AdminBookingsContent() {
       <Panel className="mt-4 overflow-hidden">
         {loading ? (
           <TableSkeleton rows={6} cols={7} />
-        ) : !data?.bookings.length ? (
+        ) : !rows.length ? (
           <EmptyState
             icon={Inbox}
             title="No bookings match these filters"
@@ -363,10 +376,16 @@ function AdminBookingsContent() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-border/70">
-                {data.bookings.map((b) => (
+                {rows.map((b) => (
                   <tr key={b.id} className="transition-colors hover:bg-muted/40">
                     <td className="px-4 py-3">
-                      <p className="font-medium text-foreground">{b.guestName}</p>
+                      <button
+                        type="button"
+                        className="text-left font-medium text-foreground hover:underline"
+                        onClick={() => openDrawer(b.id)}
+                      >
+                        {b.guestName}
+                      </button>
                       <p className="font-mono text-xs font-semibold tracking-wider text-foreground">
                         {b.reference}
                       </p>
@@ -387,21 +406,24 @@ function AdminBookingsContent() {
                       <div className="flex items-center gap-1.5">
                         <TypeBadge type={b.type} />
                         <span className="text-sm text-foreground">
-                          {b.type === 'ROOM' ? b.roomNo ?? '—' : b.tableNo ?? '—'}
+                          {b.type === 'TABLE' ? b.tableNo ?? '—' : b.roomNo ?? '—'}
                         </span>
                       </div>
                       <p className="mt-0.5 text-xs text-muted-foreground">
-                        {b.type === 'ROOM' ? b.roomName ?? '' : ''} · {b.guestCount} pax
+                        {b.type !== 'TABLE' ? b.roomName ?? '' : ''} · {b.guestCount} pax
                       </p>
                     </td>
                     <td className="whitespace-nowrap px-4 py-3 text-sm tabular-nums text-muted-foreground">
-                      {b.type === 'ROOM'
+                      {b.type !== 'TABLE'
                         ? `${day(b.checkInDate)} → ${day(b.checkOutDate)}`
                         : dayTime(b.bookingDate)}
                     </td>
                     <td className="px-4 py-3"><StatusBadge status={b.status} /></td>
                     <td className="px-4 py-3">
-                      <PaymentBadge status={b.paymentStatus} mode={b.paymentMode} />
+                      <div className="flex flex-col items-start gap-1">
+                        <PaymentBadge status={b.paymentStatus} mode={b.paymentMode} />
+                        <RefundBadge status={b.refundStatus} />
+                      </div>
                     </td>
                     <td className="whitespace-nowrap px-4 py-3 text-right">
                       <span className="font-medium tabular-nums">{inr(b.totalPrice)}</span>
@@ -431,11 +453,18 @@ function AdminBookingsContent() {
                             onClick={() => runAction(b.id, 'CHECK_OUT')}
                           />
                         )}
-                        {!['CANCELLED', 'CHECKED_OUT'].includes(b.status) && (
+                        <Button
+                          size="sm" variant="ghost"
+                          className="h-7 w-7 p-0 text-muted-foreground"
+                          onClick={() => openDrawer(b.id)} title="Details, payments & actions"
+                        >
+                          <PanelRightOpen className="h-3.5 w-3.5" />
+                        </Button>
+                        {!['CANCELLED', 'CHECKED_OUT', 'NO_SHOW'].includes(b.status) && (
                           <Button
                             size="sm" variant="ghost" disabled={busy === b.id}
                             className="h-7 w-7 p-0 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                            onClick={() => cancel(b)} title="Cancel booking"
+                            onClick={() => openDrawer(b.id, 'cancel')} title="Cancel booking"
                           >
                             <XCircle className="h-3.5 w-3.5" />
                           </Button>
@@ -450,11 +479,11 @@ function AdminBookingsContent() {
         )}
 
         {data && data.pagination.total > 0 && (
-          <div className="flex items-center justify-between border-t border-border/70 px-4 py-3 text-sm">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/70 px-4 py-3 text-sm">
             <p className="text-xs text-muted-foreground">
               Showing{' '}
               <span className="font-medium tabular-nums text-foreground">
-                {data.bookings.length}
+                {rows.length}
               </span>{' '}
               of{' '}
               <span className="font-medium tabular-nums text-foreground">
@@ -484,6 +513,13 @@ function AdminBookingsContent() {
           </div>
         )}
       </Panel>
+
+      <BookingDetailDrawer
+        bookingId={drawer?.id ?? null}
+        initialPanel={drawer?.panel ?? null}
+        onClose={() => setDrawer(null)}
+        onChanged={load}
+      />
     </div>
   )
 }

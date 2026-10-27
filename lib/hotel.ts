@@ -31,7 +31,7 @@ export const HOTEL = {
     items: [
       'Government-issued photo ID is required for all guests at check-in.',
       'Children under 6 stay free when sharing the existing bedding.',
-      'Free cancellation up to 24 hours before check-in.',
+      'Cancellation and refunds follow the policy shown at checkout and on your booking.',
       'Pets are welcome in ground-floor rooms on request.',
       'The property is entirely non-smoking; smoking is permitted in the courtyard.',
     ],

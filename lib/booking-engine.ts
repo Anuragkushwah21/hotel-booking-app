@@ -38,6 +38,8 @@ import type {
 import { prisma } from './prisma'
 import { getHotelSettings, getPricingCalendar } from './settings'
 import { priceTable, quoteStay, quoteTableOnly } from './pricing'
+import { dateKey, istDayBounds } from './format'
+import { transfersForBooking, type TransferDetails } from './transfers'
 
 type Tx = Prisma.TransactionClient
 
@@ -160,20 +162,52 @@ export class BookingError extends Error {
 
 const MS_PER_DAY = 1000 * 60 * 60 * 24
 
+/**
+ * Nights between two stay dates, counted on the hotel's (IST) calendar. Using
+ * Date#setHours here would count in the *server's* timezone (UTC on Vercel),
+ * which shifts the day boundary by 5½ hours.
+ */
 export function nightsBetween(checkIn: Date, checkOut: Date): number {
-  return Math.round((startOfDay(checkOut).getTime() - startOfDay(checkIn).getTime()) / MS_PER_DAY)
+  const a = new Date(`${dateKey(checkIn)}T00:00:00Z`).getTime()
+  const b = new Date(`${dateKey(checkOut)}T00:00:00Z`).getTime()
+  return Math.round((b - a) / MS_PER_DAY)
 }
 
+/** Midnight IST of the day `d` falls on. */
 export function startOfDay(d: Date): Date {
-  const copy = new Date(d)
-  copy.setHours(0, 0, 0, 0)
-  return copy
+  return istDayBounds(dateKey(d)).start
 }
 
+/** Last millisecond (IST) of the day `d` falls on. */
 export function endOfDay(d: Date): Date {
-  const copy = new Date(d)
-  copy.setHours(23, 59, 59, 999)
-  return copy
+  return new Date(istDayBounds(dateKey(d)).end.getTime() - 1)
+}
+
+/** Online guests can't book a stay that started on an earlier day. */
+function assertStayNotInPast(checkIn: Date) {
+  if (dateKey(checkIn) < dateKey(new Date())) {
+    throw new BookingError('Check-in date is in the past', 400, 'PAST_DATE')
+  }
+}
+
+/** A table slot must be in the future and inside the restaurant's seating window. */
+function assertTableSlotBookable(
+  time: string,
+  slotStart: Date,
+  settings: { restaurantOpenTime: string; restaurantLastSeating: string },
+  source: BookingSource,
+) {
+  // The desk may seat a walk-in "now"; online guests need a future slot.
+  if (source === 'ONLINE' && slotStart.getTime() < Date.now()) {
+    throw new BookingError('That time has already passed — please pick a later slot', 400, 'PAST_SLOT')
+  }
+  if (time < settings.restaurantOpenTime || time > settings.restaurantLastSeating) {
+    throw new BookingError(
+      `The restaurant seats guests between ${settings.restaurantOpenTime} and ${settings.restaurantLastSeating}`,
+      400,
+      'OUTSIDE_HOURS',
+    )
+  }
 }
 
 function parseDate(value: unknown, field: string): Date {
@@ -375,11 +409,12 @@ export async function findAvailableTables(
   date: string,
   time: string,
   guestCount = 1,
-  opts: { excludeBookingId?: string } = {},
+  opts: { excludeBookingId?: string; source?: BookingSource } = {},
 ) {
   const slotStart = parseSlot(date, time)
   const slotEnd = new Date(slotStart.getTime() + TABLE_SLOT_HOURS * 60 * 60 * 1000)
   const seats = Math.max(1, Number(guestCount) || 1)
+  assertTableSlotBookable(time, slotStart, await getHotelSettings(), opts.source ?? 'ONLINE')
 
   const candidates = await prisma.table.findMany({
     where: { status: 'AVAILABLE', capacity: { gte: seats } },
@@ -495,11 +530,16 @@ export async function quoteRoomBooking(input: {
   let table: { available: boolean; tableNo?: string; reason?: string } | null = null
   if (input.table) {
     const tableGuests = Math.max(1, Number(input.table.guestCount) || guestCount)
-    const { tables } = await findAvailableTables(input.table.date, input.table.time, tableGuests)
-    const pick = input.table.tableId ? tables.find((t) => t.id === input.table!.tableId) : tables[0]
-    table = pick
-      ? { available: true, tableNo: pick.tableNo }
-      : { available: false, reason: 'No table is free at that time' }
+    try {
+      const { tables } = await findAvailableTables(input.table.date, input.table.time, tableGuests)
+      const pick = input.table.tableId ? tables.find((t) => t.id === input.table!.tableId) : tables[0]
+      table = pick
+        ? { available: true, tableNo: pick.tableNo }
+        : { available: false, reason: 'No table is free at that time' }
+    } catch (error) {
+      if (!(error instanceof BookingError)) throw error
+      table = { available: false, reason: error.message }
+    }
   }
 
   const quote = quoteStay({
@@ -552,6 +592,8 @@ export type CreateRoomBookingInput = {
   /** Manager override of the computed grand total (e.g. a negotiated walk-in rate). */
   priceOverride?: number | null
   adminNotes?: string | null
+  /** Pickup / drop travel details; kept only for the transfer add-ons booked. */
+  transfer?: Parameters<typeof transfersForBooking>[1]
 } & DeskSettlement
 
 export async function createRoomBooking(input: CreateRoomBookingInput) {
@@ -569,8 +611,10 @@ export async function createRoomBooking(input: CreateRoomBookingInput) {
 
   const guestCount = Math.max(1, Number(input.guestCount) || 1)
   const addOns = validAddOnCodes(input.addOns)
+  const transferDetails: TransferDetails | null = transfersForBooking(addOns, input.transfer)
 
   assertSourceIntegrity(input.source, input.bookedById)
+  if (input.source === 'ONLINE') assertStayNotInPast(checkIn)
 
   return prisma.$transaction(
     async (tx) => {
@@ -602,11 +646,19 @@ export async function createRoomBooking(input: CreateRoomBookingInput) {
       let tableSlot: Date | null = null
       let tableGuests: number | null = null
       let tableSkipped: string | null = null
+      const settings = await getHotelSettings(tx)
       if (input.table) {
         tableGuests = Math.max(1, Number(input.table.guestCount) || guestCount)
         tableSlot = parseSlot(input.table.date, input.table.time)
-        table = await allocateTable(tx, tableSlot, tableGuests, input.table.tableId)
-        if (!table) {
+        try {
+          assertTableSlotBookable(input.table.time, tableSlot, settings, input.source)
+          table = await allocateTable(tx, tableSlot, tableGuests, input.table.tableId)
+        } catch (error) {
+          if (!(error instanceof BookingError) || input.table.required) throw error
+          table = null
+          tableSkipped = `${error.message}, so the room was booked on its own.`
+        }
+        if (!table && !tableSkipped) {
           if (input.table.required) {
             throw new BookingError('No table available at the selected time', 409, 'NO_SLOT')
           }
@@ -614,10 +666,7 @@ export async function createRoomBooking(input: CreateRoomBookingInput) {
         }
       }
 
-      const [settings, calendar] = await Promise.all([
-        getHotelSettings(tx),
-        getPricingCalendar(checkIn, checkOut, tx),
-      ])
+      const calendar = await getPricingCalendar(checkIn, checkOut, tx)
 
       // Price is always computed server-side. A client-supplied total is never
       // trusted; a manager may override, and that override is audited.
@@ -661,6 +710,8 @@ export async function createRoomBooking(input: CreateRoomBookingInput) {
           baseAmount: quote.roomAmount + quote.tableAmount,
           addOnsAmount,
           taxAmount: quote.taxAmount,
+          taxBreakdown: quote.taxBreakdown,
+          ...(transferDetails ? { transferDetails } : {}),
           totalPrice,
           paymentRule: input.source === 'ONLINE' ? quote.rule : 'DESK',
           ...money.bookingFields,
@@ -709,12 +760,14 @@ export async function createTableBooking(input: CreateTableBookingInput) {
 
   return prisma.$transaction(
     async (tx) => {
+      const settings = await getHotelSettings(tx)
+      assertTableSlotBookable(input.time, slotStart, settings, input.source)
+
       const table = await allocateTable(tx, slotStart, guestCount, input.tableId)
       if (!table) {
         throw new BookingError('No table available at the selected time', 409, 'NO_SLOT')
       }
 
-      const settings = await getHotelSettings(tx)
       const addOnsAmount = priceAddOns(addOns, 1, guestCount)
       const quote = quoteTableOnly(guestCount, addOnsAmount, settings)
       const totalPrice =
@@ -744,6 +797,7 @@ export async function createTableBooking(input: CreateTableBookingInput) {
           baseAmount: quote.tableAmount,
           addOnsAmount,
           taxAmount: quote.taxAmount,
+          taxBreakdown: quote.taxBreakdown,
           totalPrice,
           paymentRule: input.source === 'ONLINE' ? quote.rule : 'DESK',
           ...money.bookingFields,

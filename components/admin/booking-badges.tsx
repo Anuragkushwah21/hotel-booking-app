@@ -32,6 +32,7 @@ const STATUS: Record<string, { label: string; className: string; dot: string }> 
   CHECKED_IN:  { label: 'Checked in',  className: 'border-emerald-200 bg-emerald-50 text-emerald-700', dot: 'bg-emerald-500' },
   CHECKED_OUT: { label: 'Checked out', className: 'border-zinc-200 bg-zinc-50 text-zinc-600',        dot: 'bg-zinc-400' },
   CANCELLED:   { label: 'Cancelled',   className: 'border-rose-200 bg-rose-50 text-rose-700',        dot: 'bg-rose-500' },
+  NO_SHOW:     { label: 'No-show',     className: 'border-stone-300 bg-stone-100 text-stone-700',    dot: 'bg-stone-500' },
 }
 
 export function StatusBadge({ status }: { status: string }) {
